@@ -1,190 +1,128 @@
-from typing import Mapping
+"""Device reductions first; one host transfer per report."""
+
+from pathlib import Path
+import json
+
+import jax
+import jax.numpy as jnp
+import wandb
 
 
-def build_wandb_policy_training_payload(
-    *,
-    phase_name: str,
-    phase_epoch: int,
-    global_epoch: int,
-    critic_grad_scale: float,
-    actor_loss_mean: float,
-    critic_loss_mean: float,
-    true_kl_mean: float,
-    clip_fraction: float,
-    explained_variance: float,
-    return_std: float,
-    value_std: float,
-    critic_loss_normalized: float,
-    mean_std: float,
-    mean_log_std: float,
-    mean_episodic_returns: float,
-    success_env_count: float,
-    success_rate: float,
-    nominal_env_count: float,
-    failed_env_count: float,
-    nominal_success_rate: float,
-    failed_success_rate: float,
-    terminated_step_count: float,
-    success_termination_step_count: float,
-    failure_termination_step_count: float,
-    success_termination_env_rate: float,
-    failure_termination_env_rate: float,
-    terminal_envs_at_end: float,
-    terminal_env_rate_at_end: float,
-    mean_lateral_error: float,
-    mean_angle_error: float,
-    mean_final_position_error: float,
-    current_failure_fraction: float,
-    current_disturbance_fraction: float,
-    current_difficulty_bin: int,
-    current_authority_regime: int,
-    current_task_feasibility_regime: int,
-    median_final_position_error: float,
-    p75_final_position_error: float,
-    p90_final_position_error: float,
-    fraction_pos_within_radius: float,
-    fraction_speed_within_limit: float,
-    fraction_att_within_limit: float,
-    fraction_ang_speed_within_limit: float,
-    fraction_all_conditions_except_hold: float,
-    mean_consecutive_success_hold_steps: float,
-    reward_component_means: Mapping[str, float],
-    reward_scale_metrics: Mapping[str, float],
-) -> dict[str, float | int | str]:
-    reward_payload = {
-        f"reward_components/{metric_name}": float(metric_value)
-        for metric_name, metric_value in reward_component_means.items()
-    }
-    reward_scale_payload = {
-        f"reward_scale/{metric_name}": float(metric_value)
-        for metric_name, metric_value in reward_scale_metrics.items()
-    }
+def rollout_metrics(result):
+    output = result.step_outputs
+    completed = result.done_masks.sum()
+    successes = output.success_terminals.sum()
     return {
-        "curriculum/phase": phase_name,
-        "curriculum/phase_epoch": phase_epoch,
-        "curriculum/global_epoch": global_epoch,
-        "curriculum/critic_grad_scale": critic_grad_scale,
-        "curriculum/failure_fraction": current_failure_fraction,
-        "curriculum/disturbance_fraction": current_disturbance_fraction,
-        "curriculum/difficulty_bin": current_difficulty_bin,
-        "curriculum/authority_regime": current_authority_regime,
-        "curriculum/task_feasibility_regime": current_task_feasibility_regime,
-        "training_health/true_kl_mean": true_kl_mean,
-        "training_health/explained_variance": explained_variance,
-        "policy_stats/mean_std": mean_std,
-        "objective/train_mean_episodic_return": mean_episodic_returns,
-        "task_performance/success_rate": success_rate,
-        "task_performance/success_rate_nominal_envs": nominal_success_rate,
-        "task_performance/success_rate_failed_envs": failed_success_rate,
-        "task_performance/nominal_env_count": nominal_env_count,
-        "task_performance/failed_env_count": failed_env_count,
-        "task_performance/mean_lateral_error": mean_lateral_error,
-        "task_performance/mean_angle_error": mean_angle_error,
-        "task_performance/mean_final_position_error": mean_final_position_error,
-        "task_performance/median_final_position_error": median_final_position_error,
-        "task_performance/p75_final_position_error": p75_final_position_error,
-        "task_performance/p90_final_position_error": p90_final_position_error,
-        "task_performance/fraction_pos_within_radius": fraction_pos_within_radius,
-        "task_performance/fraction_speed_within_limit": fraction_speed_within_limit,
-        "task_performance/fraction_att_within_limit": fraction_att_within_limit,
-        "task_performance/fraction_ang_speed_within_limit": fraction_ang_speed_within_limit,
-        "task_performance/fraction_all_conditions_except_hold": fraction_all_conditions_except_hold,
-        "task_performance/mean_consecutive_success_hold_steps": mean_consecutive_success_hold_steps,
-        **reward_payload,
-        **reward_scale_payload,
+        "mean_episodic_returns": result.episode_returns.sum()
+        / jnp.maximum(completed, 1),
+        "success_rate": successes / jnp.maximum(completed, 1),
+        "terminated_step_count": output.terminals.sum(),
+        "success_termination_step_count": successes,
+        "failure_termination_step_count": output.failure_terminals.sum(),
+        "timeout_count": result.truncated_masks.sum(),
+        "completed_episode_count": completed,
+        "mean_lateral_error": jnp.linalg.norm(
+            output.next_position_error, axis=-1
+        ).mean(),
+        "mean_angle_error": jnp.rad2deg(output.next_attitude_error).mean(),
+        "mean_final_position_error": jnp.linalg.norm(
+            output.next_position_error[-1],
+            axis=-1,
+        ).mean(),
+        "mean_reward": output.rewards.mean(),
+        "control_effort": jnp.square(result.actions).sum(axis=-1).mean(),
     }
 
 
-def build_logger_policy_training_payload(
-    *,
-    phase_name: str,
-    phase_epoch: int,
-    critic_grad_scale: float,
-    actor_loss_mean: float,
-    critic_loss_mean: float,
-    true_kl_mean: float,
-    clip_fraction: float,
-    explained_variance: float,
-    return_std: float,
-    value_std: float,
-    critic_loss_normalized: float,
-    success_env_count: float,
-    success_rate: float,
-    nominal_env_count: float,
-    failed_env_count: float,
-    nominal_success_rate: float,
-    failed_success_rate: float,
-    terminated_step_count: float,
-    success_termination_step_count: float,
-    failure_termination_step_count: float,
-    success_termination_env_rate: float,
-    failure_termination_env_rate: float,
-    terminal_envs_at_end: float,
-    terminal_env_rate_at_end: float,
-    mean_std: float,
-    mean_lateral_error: float,
-    mean_angle_error: float,
-    mean_final_position_error: float,
-    current_failure_fraction: float,
-    current_disturbance_fraction: float,
-    current_difficulty_bin: int,
-    current_authority_regime: int,
-    current_task_feasibility_regime: int,
-    median_final_position_error: float,
-    p75_final_position_error: float,
-    p90_final_position_error: float,
-    fraction_pos_within_radius: float,
-    fraction_speed_within_limit: float,
-    fraction_att_within_limit: float,
-    fraction_ang_speed_within_limit: float,
-    fraction_all_conditions_except_hold: float,
-    mean_consecutive_success_hold_steps: float,
-    train_mean_episodic_returns: float,
-    reward_scale_metrics: Mapping[str, float],
-) -> dict[str, float | int | str]:
+def report(runner, stage, epoch, metrics):
+    values = {name: float(value) for name, value in jax.device_get(metrics).items()}
+    path = (
+        Path(runner.ckpt_dir).parent
+        / "metrics"
+        / f"{runner.env.run_name}_seed{runner.env.env_cfg.sim.seed}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "experiment": runner.env.run_name,
+                    "seed": runner.env.env_cfg.sim.seed,
+                    "stage": stage,
+                    "epoch": epoch,
+                    **values,
+                }
+            )
+            + "\n"
+        )
+    if runner.agent.has_logger:
+        runner.env.logger.log(
+            runner.env.run_id,
+            float(epoch),
+            run_name=runner.env.run_name,
+            stage=stage,
+            **values,
+        )
+    if runner.env.use_wandb:
+        wandb.log({f"{stage}/{key}": value for key, value in values.items()})
+    print(
+        f"{stage} {epoch}: "
+        + ", ".join(
+            f"{key}={value:.4g}"
+            for key, value in values.items()
+            if key
+            in (
+                "actor_loss_mean",
+                "critic_loss_mean",
+                "am_train_loss_mean",
+                "success_rate",
+            )
+        ),
+        flush=True,
+    )
+    return values
+
+
+def episode_metrics(result, *, dt, onset_seconds):
+    """One initial episode per environment, excluding all post-reset samples."""
+    output = result.step_outputs
+    prior_done = jnp.concatenate(
+        (
+            jnp.zeros_like(result.done_masks[:1], dtype=jnp.int32),
+            jnp.cumsum(result.done_masks[:-1], axis=0),
+        ),
+        axis=0,
+    )
+    valid = prior_done == 0
+    success = output.success_terminals & valid
+    failure = output.failure_terminals & valid
+    successes = success.any(axis=0)
+    failures = failure.any(axis=0)
+    denominator = jnp.maximum(valid.sum(), 1)
+    times = (jnp.arange(valid.shape[0]) + 1)[:, None] * dt
+    exposed = (valid & (times > onset_seconds)).any(axis=0)
+    recovered = (success & (times > onset_seconds)).any(axis=0)
+    recovery_times = jnp.where(
+        success & (times > onset_seconds),
+        times - onset_seconds,
+        0.0,
+    ).sum(axis=0)
     return {
-        "phase": phase_name,
-        "phase_epoch": phase_epoch,
-        "critic_grad_scale": critic_grad_scale,
-        "failure_fraction": current_failure_fraction,
-        "disturbance_fraction": current_disturbance_fraction,
-        "difficulty_bin": current_difficulty_bin,
-        "authority_regime": current_authority_regime,
-        "task_feasibility_regime": current_task_feasibility_regime,
-        "actor_loss_mean": actor_loss_mean,
-        "critic_loss_mean": critic_loss_mean,
-        "true_kl_mean": true_kl_mean,
-        "clip_fraction": clip_fraction,
-        "explained_variance": explained_variance,
-        "return_std": return_std,
-        "value_std": value_std,
-        "critic_loss_normalized": critic_loss_normalized,
-        "success_env_count": success_env_count,
-        "success_rate": success_rate,
-        "nominal_env_count": nominal_env_count,
-        "failed_env_count": failed_env_count,
-        "nominal_success_rate": nominal_success_rate,
-        "failed_success_rate": failed_success_rate,
-        "terminated_step_count": terminated_step_count,
-        "success_termination_step_count": success_termination_step_count,
-        "failure_termination_step_count": failure_termination_step_count,
-        "success_termination_env_rate": success_termination_env_rate,
-        "failure_termination_env_rate": failure_termination_env_rate,
-        "terminal_envs_at_end": terminal_envs_at_end,
-        "terminal_env_rate_at_end": terminal_env_rate_at_end,
-        "mean_std": mean_std,
-        "mean_lateral_error": mean_lateral_error,
-        "mean_angle_error": mean_angle_error,
-        "mean_final_position_error": mean_final_position_error,
-        "median_final_position_error": median_final_position_error,
-        "p75_final_position_error": p75_final_position_error,
-        "p90_final_position_error": p90_final_position_error,
-        "fraction_pos_within_radius": fraction_pos_within_radius,
-        "fraction_speed_within_limit": fraction_speed_within_limit,
-        "fraction_att_within_limit": fraction_att_within_limit,
-        "fraction_ang_speed_within_limit": fraction_ang_speed_within_limit,
-        "fraction_all_conditions_except_hold": fraction_all_conditions_except_hold,
-        "mean_consecutive_success_hold_steps": mean_consecutive_success_hold_steps,
-        "train_mean_episodic_returns": train_mean_episodic_returns,
-        **{f"reward_scale_{k}": float(v) for k, v in reward_scale_metrics.items()},
+        "success_rate": successes.mean(),
+        "failure_rate": failures.mean(),
+        "timeout_rate": (~(successes | failures)).mean(),
+        "mean_episodic_returns": (output.rewards * valid).sum(axis=0).mean(),
+        "mean_lateral_error": (
+            jnp.linalg.norm(output.next_position_error, axis=-1) * valid
+        ).sum()
+        / denominator,
+        "mean_angle_error": (jnp.rad2deg(output.next_attitude_error) * valid).sum()
+        / denominator,
+        "control_effort": (jnp.square(result.actions).sum(axis=-1) * valid).sum()
+        / denominator,
+        "fault_exposed_envs": exposed.sum(),
+        "recovered_envs": recovered.sum(),
+        "recovery_fraction": recovered.sum() / jnp.maximum(exposed.sum(), 1),
+        # Interpret only alongside recovered_envs; zero means no measured recoveries when count=0.
+        "mean_recovery_seconds": recovery_times.sum() / jnp.maximum(recovered.sum(), 1),
     }

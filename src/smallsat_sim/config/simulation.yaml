@@ -1,0 +1,24 @@
+# Shared simulation and output defaults. Environment YAML can override these sections.
+viewer:
+  viewer_decimation: 10
+  use_viser: false
+  viser_port: 8080
+sim:
+  dt: 0.01
+  max_sim_time: 200
+  seed: 42
+  verbose: false
+  noise:
+    add_obs_noise: false
+    sigma_r: 0.01
+    sigma_q: 0.001
+    sigma_v: 0.001
+    sigma_w: 0.001
+  obs:
+    v_frame: body
+renderer:
+  start_recording: 0.0
+  end_recording: 120
+  width: 1920
+  height: 1080
+  fps: 30

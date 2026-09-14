@@ -1,4 +1,5 @@
-# Base classes
+"""Gaussian-process MPC controller for model-error compensation."""
+
 from smallsat_sim.controllers.base_mpc_controller import BaseMPCController
 from smallsat_sim.envs.base_env import BaseEnv
 
@@ -18,10 +19,11 @@ from smallsat_sim.controllers.gp_mpc.online_learning.utils import (
 import gpytorch
 from gpytorch.constraints.constraints import Positive
 import os
+import tempfile
+from smallsat_sim.controllers.state import body_state
 import numpy as np
 import torch
 import casadi as ca
-import mujoco
 from scipy.stats import norm
 import time
 
@@ -60,8 +62,7 @@ from l4acados.controllers.zoro_acados_utils import setup_sim_from_ocp
 #     generate_grid_points,
 # )
 
-from smallsat_sim.gp_utils.gp_hyperparam_training import generate_train_inputs_acados, generate_train_outputs_at_inputs, train_gp_model
-from smallsat_sim.gp_utils.gp_utils import gp_data_from_model_and_path, gp_derivative_data_from_model_and_path, plot_gp_data, generate_grid_points
+
 
 
 # from zero_order_gpmpc.models.gpytorch_models.gpytorch_residual_model import (
@@ -103,6 +104,8 @@ class GPMPC(BaseMPCController):
 
     def __init__(self, env: BaseEnv, planner) -> None:
         # Fetch correct controller config
+        from smallsat_sim.planners.validation import require_contouring_planner
+        require_contouring_planner(planner)
         self.ctrl_cfg = env.env_cfg.control.GPMPC
         self.N = self.ctrl_cfg.N
 
@@ -111,7 +114,13 @@ class GPMPC(BaseMPCController):
 
         # Save relevant components from environment locally
         self.f = env.symbolic_model.f_expl_expr_func
-        self.f_int = env.symbolic_model.get_integrator(dt=self.ctrl_cfg.Ts)
+        # Training targets must use the same integration scheme as prediction;
+        # otherwise the GP learns Euler discretization error even without a fault.
+        from smallsat_sim.controllers.nominal_mpc.reference import rk4_step
+        model = env.symbolic_model
+        integrator = ca.Function("gp_nominal_step", [model.x, model.u],
+                                 [rk4_step(self.f, model.x, model.u, self.ctrl_cfg.Ts)])
+        self.f_int = lambda x, u: integrator(x, u).toarray()
 
         # # Initialize logger
         # self.logger = Logger()
@@ -126,7 +135,7 @@ class GPMPC(BaseMPCController):
         self._create_zoro_description(env)
 
         # Setup Gaussian Process
-        self._setup_gp(obs=env.get_obs())
+        self._setup_gp(obs=body_state(env))
 
         # Miscellaneous
         self.last_solution = {
@@ -147,28 +156,21 @@ class GPMPC(BaseMPCController):
         # Initialize solver
         self._initialize_solver(env)
 
-        # Check if there is a viewer. In case there is not,
-        # dynamically allocate the visualize method to a lambda
-        # function doing nothing.
-        if env.viewer:
-            self.viewer = env.viewer
+        self.visualization = getattr(env, "visualization", None)
+        self._record_video = bool(getattr(getattr(env, "args", None), "video", False))
+        from copy import deepcopy
+        self._fresh_residual_model = deepcopy(self.gp_mpc.residual_model)
+        self._previous_time = None
 
-            # Setup util parameters for visualization
-            self.viz_offset = self.viewer.user_scn.ngeom
-            self.viewer.user_scn.ngeom += self.ctrl_cfg.N + 1
-        else:
-            self._visualize_prediction = lambda *args, **kwargs: None
-
-        # Check if there is a renderer. In case there is not,
-        # dynamically allocate the visualize_renderer method
-        # to a lambda function doing nothing.
-        if env.renderer:
-            self.renderer = env.renderer
-            self.frames = env.frames
-            self.data = env.data
-            self.env_cfg = env.env_cfg
-        else:
-            self._visualize_prediction_renderer = lambda *args, **kwargs: None
+    def reset(self, env):
+        """Clear trial-specific training data, residual history and warm starts."""
+        from copy import deepcopy
+        self.gp_mpc.residual_model = deepcopy(self._fresh_residual_model)
+        self._previous_time = None
+        self.x_past = np.r_[body_state(env), 0.]
+        self.u_past = np.zeros(self.nu)
+        self.gp_mpc.ocp_solver.reset()
+        self._initialize_solver(env)
 
     def _setup_gp(self, obs: np.ndarray) -> None:
         """
@@ -194,42 +196,13 @@ class GPMPC(BaseMPCController):
 
         # Initialize some hyperparameters for GP
         # TODO: Move to configuration file
-        self.M = 300  # number of points in list
+        self.M = int(getattr(self.ctrl_cfg, "max_points", 300))
         self.gp_update_counter = 0  # Keep track how many times dict has been updated
         self.gp_initialized = False  # Keep track if GP is already initialized
 
         # Setup residual model with trained GP
-        input_feature_selection = np.array(
-            [
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                0,
-            ]
-        )
+        input_feature_selection = np.r_[np.zeros(self.nx, dtype=int),
+                                        np.ones(self.nu - 1, dtype=int), 0]
         self.input_selection = ScaleFeatureSelector(input_feature_selection, None)
         self.residual_scaler = ResidualScaler(scale=1)
 
@@ -245,8 +218,6 @@ class GPMPC(BaseMPCController):
         )
 
         # Initialize GP model and overwrite default values
-        train_x = torch.zeros(1, 12)
-        train_y = torch.zeros(1, 6)
         mode = "Nonlinear Kernel"
         gp_model = BatchIndependentMultitaskGPModel(
             train_x=None,
@@ -255,12 +226,18 @@ class GPMPC(BaseMPCController):
             use_ard=True,
             residual_dimension=6,
             input_dimension=sum(input_feature_selection),
-            # mode=mode,
         )
 
         for name, param in gp_model.named_parameters():
             print(f"Parameter {name} has shape {param.shape} and values:")
             print(param)
+
+        if hasattr(self.ctrl_cfg, "prior_variance"):
+            gp_model.covar_module.outputscale = float(self.ctrl_cfg.prior_variance)
+        if hasattr(self.ctrl_cfg, "lengthscale"):
+            gp_model.covar_module.base_kernel.lengthscale = float(self.ctrl_cfg.lengthscale)
+        if hasattr(self.ctrl_cfg, "observation_noise"):
+            likelihood.noise = torch.tensor([float(self.ctrl_cfg.observation_noise)])
 
         # Set hyperparemters of linear kernel manually.
         gp_model = self._initialize_hyperparameters(gp_model, likelihood, mode)
@@ -351,11 +328,12 @@ class GPMPC(BaseMPCController):
 
         acados_model.x = ca.vertcat(acados_model.x, theta)
         acados_model.u = ca.vertcat(acados_model.u, d_theta)
-        acados_model.xdot = ca.vertcat(acados_model.xdot, d_theta)
+        theta_dot = ca.SX.sym("theta_dot")
+        acados_model.xdot = ca.vertcat(acados_model.xdot, theta_dot)
 
         acados_model.f_expl_expr = ca.vertcat(acados_model.f_expl_expr, d_theta)
 
-        acados_model.f_impl_expr = ca.vertcat(acados_model.f_impl_expr, 0)
+        acados_model.f_impl_expr = ca.vertcat(acados_model.f_impl_expr, theta_dot - d_theta)
 
         # Assign parameters and model
         Ts = self.ctrl_cfg.Ts
@@ -406,38 +384,15 @@ class GPMPC(BaseMPCController):
         # Contouring error
         e_c = P_n @ e
 
-        # Quaternion error
-        q_conj = np.array([q[0], -q[1], -q[2], -q[3]])
-        e_q = np.array(
-            [
-                q_des[0] * q_conj[0]
-                - q_des[1] * q_conj[1]
-                - q_des[2] * q_conj[2]
-                - q_des[3] * q_conj[3],
-                q_des[0] * q_conj[1]
-                + q_des[1] * q_conj[0]
-                + q_des[2] * q_conj[3]
-                - q_des[3] * q_conj[2],
-                q_des[0] * q_conj[2]
-                - q_des[1] * q_conj[3]
-                + q_des[2] * q_conj[0]
-                + q_des[3] * q_conj[1],
-                q_des[0] * q_conj[3]
-                + q_des[1] * q_conj[2]
-                - q_des[2] * q_conj[1]
-                + q_des[3] * q_conj[0],
-            ]
-        )
-
-        # We only want to minimize eps part of error quaternion
-        e_q_vec = e_q - ca.DM([1, 0, 0, 0])
+        from smallsat_sim.controllers.nominal_mpc.reference import attitude_cost
+        rotation_cost = attitude_cost(q, q_des, Q_q)
 
         # Setup cost
         ocp.cost.cost_type = "EXTERNAL"
         ocp.model.cost_expr_ext_cost = (
             q_l * e_l * e_l
             + e_c.T @ Q_c @ e_c
-            + e_q_vec.T @ Q_q @ e_q_vec
+            + rotation_cost
             + omega.T @ Q_omega @ omega
             + (model.u.T) @ R @ (model.u)
             - q_theta * d_theta
@@ -540,10 +495,6 @@ class GPMPC(BaseMPCController):
         # Slacks on lower/upper bounds
         ocp.constraints.lsbx = np.zeros(ocp.dims.nsbx)
         ocp.constraints.usbx = np.zeros(ocp.dims.nsbx)
-        ocp.constraints.usbx[7:10] = 0.05
-        ocp.constraints.usbx[7:10] = -0.05
-        ocp.constraints.usbx[10:13] = 0.02
-        ocp.constraints.usbx[10:13] = -0.02
         ocp.constraints.idxsbx = np.arange(nx)
 
         ocp.cost.Zl = 5e02 * np.ones(ocp.dims.ns)
@@ -554,14 +505,14 @@ class GPMPC(BaseMPCController):
         # Define input constraints
         # Fetch thurster limits from the model configuration
         thruster_forces = [
-            thruster.forcerange for thruster in env.model_cfg.Thrusters.thruster_list
+            thruster.forcerange for thruster in env.model_cfg.actuators
         ]
         ocp.constraints.lbu = np.array([forces[0] for forces in thruster_forces])
         ocp.constraints.ubu = np.array([forces[1] for forces in thruster_forces])
 
         # Attach dtheta constraints
         ocp.constraints.lbu = np.append(ocp.constraints.lbu, 0.0)
-        ocp.constraints.ubu = np.append(ocp.constraints.ubu, 0.2)
+        ocp.constraints.ubu = np.append(ocp.constraints.ubu, getattr(self.ctrl_cfg, "progress_rate_limit", 0.2))
         ocp.constraints.idxbu = np.arange(nu)
 
         # Set intial condition
@@ -575,13 +526,19 @@ class GPMPC(BaseMPCController):
         ocp.solver_options.tf = Ts * self.ctrl_cfg.N
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
-        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+        # l4acados retains this value for its Python outer loop even though
+        # the generated SQP_RTI solver itself performs only one iteration.
+        ocp.solver_options.nlp_solver_max_iter = int(getattr(self.ctrl_cfg, "nlp_iterations", 1))
+        ocp.solver_options.hessian_approx = "EXACT"
+        ocp.solver_options.regularize_method = "PROJECT"
         ocp.solver_options.integrator_type = "ERK"
+        ocp.solver_options.sim_method_num_stages = 4
+        ocp.solver_options.sim_method_num_steps = 1
         ocp.solver_options.print_level = 0
 
         # Set code generation directory
         self.work_dir = os.path.dirname(os.path.abspath(__file__))
-        self.save_dir = os.path.join(self.work_dir, "c_generated_code")
+        self.save_dir = getattr(self.ctrl_cfg, "code_export_directory", None) or tempfile.mkdtemp(prefix="smallsat_gpmpc_")
         ocp.code_export_directory = self.save_dir
 
         # Save ocp for further use
@@ -673,29 +630,28 @@ class GPMPC(BaseMPCController):
         Calculate the control input based on current observation
         """
         # Retrieve some data which are used in multiple functions
-        obs = env.get_obs()
+        obs = body_state(env)
         self.run_id = env.run_id
         self.timestamp = env.data.time
+        if self._previous_time is not None and self.timestamp < self._previous_time:
+            self.reset(env)
 
         # Check if new observation shall be added to dictionary
-        res_output = self._compute_residual(obs)
+        res_output = (self._compute_residual(obs) if getattr(self.ctrl_cfg, "learning_enabled", True)
+                      and self._previous_time is not None
+                      and np.isclose(self.timestamp - self._previous_time, self.ctrl_cfg.Ts)
+                      else None)
 
         # If logging enabled, calculate the prediction errors
         # NOTE: Must be done here, before new observation is added
         # to the GP's dictionary
-        self._calc_prediction_errors(env)
+        if res_output is not None:
+            self._calc_prediction_errors(env)
 
         if res_output is not None:
             residual, x_train = res_output
             residual = self.residual_scaler(residual)
       
-            # Add noise to residual
-            # TODO: Move this to somewhere else --> Maybe BaseEnv file
-            if True:
-                residual = residual + np.random.normal(0, 5e-6, residual.shape)
-                if self.has_logger:
-                    self.logger.log(run_id=self.run_id, timestamp=self.timestamp, gp_GT=residual)
-
             start_time = time.perf_counter()
             self.gp_mpc.residual_model.record_datapoint(
                 x_input=x_train, y_target=residual, timestamp=env.data.time
@@ -722,28 +678,44 @@ class GPMPC(BaseMPCController):
             self.gp_mpc.ocp_solver.set(i, "u", self.last_solution["inputs"][i_next])
 
         # Set initial condition
-        _, theta_init = self.planner.closest_point_on_trajectory(env.get_obs()[0:3])
-        xinit = np.append(env.get_obs(), theta_init)
+        _, theta_init = self.planner.closest_point_on_trajectory(obs[0:3])
+        # Geometric projection wraps every lap, whereas the warm start and
+        # segment origins use unwrapped arc length. Keep the same lap branch.
+        from smallsat_sim.controllers.nominal_mpc.reference import unwrap_progress
+        theta_init = unwrap_progress(theta_init, self.theta_prev[1], self.planner.trajectory.length)
+        xinit = np.append(obs, theta_init)
         self.gp_mpc.ocp_solver.set(0, "lbx", xinit)
         self.gp_mpc.ocp_solver.set(0, "ubx", xinit)
 
         # Solve for the first control input in receding horizon fashion
         start_time = time.perf_counter()
-        self.gp_mpc.solve()
+        self._previous_time = None
+        try:
+            status = self.gp_mpc.solve()
+        except Exception as error:
+            status = int(self.gp_mpc.ocp_solver.status)
+            if status != 0:
+                from smallsat_sim.controllers.nominal_mpc.reference import MPCSolverError
+                raise MPCSolverError(status) from error
+            raise
         end_time = time.perf_counter()
 
         if self.has_logger:
             self.logger.log(run_id=self.run_id, timestamp=self.timestamp, solve_time=((end_time-start_time)*1000))
 
+        from smallsat_sim.controllers.nominal_mpc.reference import require_valid_control
+        require_valid_control(status, np.zeros(1))
         self.X_res, self.U_res = self.gp_mpc.get_solution()
+        require_valid_control(status, self.X_res)
+        require_valid_control(status, self.U_res)
         u0 = self.U_res[0, :]
+        require_valid_control(status, u0, self.ocp_init.constraints.lbu, self.ocp_init.constraints.ubu)
 
         # Visualize
         self._visualize_prediction()
 
-        if hasattr(self, "renderer") and self.renderer is not None:
+        if self._record_video:
             _, _ = self.planner.get_reference(env.obs)
-            self._visualize_prediction_renderer()
 
         # Save current solution
         for i in range(self.N):
@@ -752,7 +724,8 @@ class GPMPC(BaseMPCController):
         self.last_solution["states"][self.N] = self.gp_mpc.ocp_solver.get(self.N, "x")
 
         # Save current observation and input
-        self.x_past[:-1], self.u_past = obs, u0
+        self.x_past[:-1], self.u_past = obs, u0.copy()
+        self._previous_time = self.timestamp
 
         # Save theta for next iteration
         for i in range(self.ctrl_cfg.N + 1):
@@ -792,7 +765,6 @@ class GPMPC(BaseMPCController):
                     ).position
                 ),i=i
             )
-            q_theta = 5e-3
 
             ref = np.concatenate((p_start, t, theta_1, q_des, np.array([q_theta])))
 
@@ -803,6 +775,8 @@ class GPMPC(BaseMPCController):
         Computes q_theta based on the distance to the waypoint.
         q_theta transitions smoothly from 5e-2 to 5e-3 as distance decreases from 1 meter to 0.
         """
+        if hasattr(self.ctrl_cfg, "progress_weight"):
+            return float(self.ctrl_cfg.progress_weight)
         upper = 5e-2
         lower = 5e-3
         if distance >= 1.5:
@@ -896,7 +870,7 @@ class GPMPC(BaseMPCController):
             and self.gp_mpc.residual_model.gp_model.train_inputs is not None
         ):
             # Retrieve obs (NOTE: Use GT obs here?)
-            obs = env.get_obs()
+            obs = body_state(env)
 
             # Calculate nominal prediction error
             e_nom = calc_model_error(
@@ -926,66 +900,24 @@ class GPMPC(BaseMPCController):
                     run_id=env.run_id, timestamp=env.data.time, e_gp=e_gp, e_nom=e_nom
                 )
 
-    def _train_gp(self) -> None:
-        """
-        Trains the gp on the offline data
-        """
-        # Train GP on data offline
-        self.gp_model, self.likelihood = train_gp_model(
-            self.gp_model,
-            torch_seed=456,
-            training_iterations=300,
-        )
-
     def _initialize_solver(self, env: BaseEnv) -> None:
         """
         Initializes the solver. Also known as "warm start".
         """
         # Retrieve closest point on track (relevant for theta)
-        _, theta_init = self.planner.closest_point_on_trajectory(env.get_obs()[0:3])
+        _, theta_init = self.planner.closest_point_on_trajectory(body_state(env)[0:3])
 
         # Array to store previous theta
         self.theta_prev = [theta_init for i in range(self.ctrl_cfg.N + 1)]
 
-        # Warm start solver
-        # Initial condition and Warm start
-        x_guess = np.zeros(
-            self.nx,
-        )
-        x_guess[0:13] = env.get_obs()[0:13].copy()
-
-        # Set theta by incrementing the previous theta
-        x_guess[-1] = theta_init
-
-        # Warm start the solver
-        for i in range(self.ctrl_cfg.N):
-            x_guess_i = x_guess.copy()
-            x_guess_i[-1] += i* self.ctrl_cfg.Ts * 0.1
-
-            self.theta_prev[i] += i* self.ctrl_cfg.Ts * 0.1
-
-            u_guess_i = np.zeros((self.nu, 1))
-            u_guess_i[-1] = 0.1
-
-            point = self.planner.trajectory.get_intermediate_reference(x_guess_i[-1])
-            x_guess_i[0:3] = point.position
-            x_guess_i[3:7] = point.attitude
-
-            x_guess_i[7:10] = 0.1 * self.planner.trajectory._get_tangent_segment(x_guess_i[-1])
-
-            self.gp_mpc.ocp_solver.set(i, "x", x_guess_i)
-            self.gp_mpc.ocp_solver.set(i, "u", u_guess_i)
-
-            if i == self.ctrl_cfg.N -1:
-                x_guess_i[-1] += i* self.ctrl_cfg.Ts * 0.1
-                self.theta_prev[-1] += i* self.ctrl_cfg.Ts * 0.1
-                self.gp_mpc.ocp_solver.set(i+1, "x", x_guess_i)
-
-
-        for i in range(self.N):
+        x_guess = np.r_[body_state(env), theta_init]
+        for i in range(self.N + 1):
+            self.gp_mpc.ocp_solver.set(i, "x", x_guess)
             self.last_solution["states"][i] = x_guess
-            self.last_solution["inputs"][i] = np.zeros((self.nu))
-        self.last_solution["states"][self.N] = x_guess
+            if i < self.N:
+                command = np.zeros(self.nu)
+                self.gp_mpc.ocp_solver.set(i, "u", command)
+                self.last_solution["inputs"][i] = command
 
     def _log(self, run_id: int, timestamp: float, env: BaseEnv) -> None:
         """
@@ -993,7 +925,7 @@ class GPMPC(BaseMPCController):
         """
         if self.has_logger:
             obs_gt = (
-                env.get_obs()
+                body_state(env)
             )  # TODO: Change this to get GT obs, once MR has been merged
 
             # Tracking error
@@ -1036,47 +968,7 @@ class GPMPC(BaseMPCController):
             )
 
     def _visualize_prediction(self) -> None:
-        """
-        Plot predicted trajectory of MPC in MuJoCo viewer.
-        """
-        for i in range(self.ctrl_cfg.N + 1):
-            point = self.gp_mpc.ocp_solver.get(i, "x")[0:3]
-            mujoco.mjv_initGeom(
-                self.viewer.user_scn.geoms[i + self.viz_offset],
-                type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                size=[0.05, 0, 0],
-                pos=point,
-                mat=np.eye(3).flatten(),
-                rgba=np.array([0, 0, 1, 2]),
-            )
-
-    def _visualize_prediction_renderer(self) -> None:
-        """
-        Plot predicted trajectory of MPC in MuJoCo renderer.
-        """
-        if (
-            self.data.time >= self.env_cfg.renderer.start_recording
-            and self.data.time <= self.env_cfg.renderer.end_recording
-        ):
-            for i in range(self.ctrl_cfg.N + 1):
-                point = self.gp_mpc.ocp_solver.get(i, "x")[0:3]
-                mujoco.mjv_initGeom(
-                    self.renderer.scene.geoms[i + self.renderer.scene.ngeom],
-                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=[0.05, 0, 0],
-                    pos=point,
-                    mat=np.eye(3).flatten(),
-                    rgba=np.array([0, 0, 1, 2]),
-                )
-
-            self.renderer.scene.ngeom += self.ctrl_cfg.N + 1
-
-            # Extract image from renderer and append it for post-processing
-            sim_img = self.renderer.render().copy()
-            self.frames.append(sim_img)
-
-            if True:
-                if hasattr(self, "logger"):
-                    self.logger.log(
-                        run_id=self.run_id, timestamp=self.data.time, frames=sim_img
-                    )
+        """Submit the predicted trajectory; rendering happens after the simulation step."""
+        if self.visualization is not None:
+            points = [self.gp_mpc.ocp_solver.get(i, "x")[0:3] for i in range(self.ctrl_cfg.N + 1)]
+            self.visualization.set_overlay("prediction", points, color=(0, 0, 1, 1), radius=.05)

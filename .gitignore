@@ -1,5 +1,7 @@
 deps/
 *.lock
+!uv.lock
+!.setup/native/tera-Cargo.lock
 
 # mujoco artifacts
 *MUJOCO_LOG*
@@ -12,6 +14,10 @@ deps/
 
 # python artifacts
 __pycache__/
+build/
+
+# cache files
+.cache/
 
 # os specific files
 .DS_Store
@@ -50,7 +56,22 @@ external/
 docker-compose.yaml
 
 # .egg-info
-src/smallsat_sim.egg-info/
+*.egg-info/
 
 # experiment results
 experiments/results/
+
+# Local controller pilot archives (canonical CSVs/configs live in experiments/).
+results/controller_pilots/
+
+# Generated release artifacts, caches, and experiment output.
+/dist/
+/results/
+/artifacts/
+/experiments/rl_results/
+.pytest_cache/
+.ruff_cache/
+
+# Published pilot evidence belongs with its configurations.
+!experiments/demonstration_use_cases/pilots/**/trials.csv
+!experiments/demonstration_use_cases/pilots/**/summary.csv

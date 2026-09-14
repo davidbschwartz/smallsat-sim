@@ -1,0 +1,25 @@
+name: Release checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-22.04
+    env:
+      MUJOCO_GL: egl
+      WANDB_MODE: disabled
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked CPU dependencies
+        run: uv sync --locked --extra paper --group dev
+      - name: Lint
+        run: uv run --no-sync ruff check src experiments examples .setup/build_release.py
+      - name: Test
+        run: uv run --no-sync pytest -q src/tests .setup/tests
+      - name: Build and smoke-test clean wheel
+        run: uv run --no-sync python .setup/build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validated-wheel
+          path: dist/*.whl

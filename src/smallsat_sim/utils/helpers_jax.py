@@ -1,7 +1,11 @@
+"""JAX numerical helpers and command-line argument parsing."""
+
 import argparse
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from smallsat_sim.utils.quaternions_jax import quat_multiply, quat_conjugate
+from smallsat_sim.utils.quaternions_jax import quaternion_to_rotation_matrix, quaternion_rate_matrix
 
 
 # Import all base classes for typing
@@ -11,6 +15,8 @@ from smallsat_sim.envs.base_env import BaseEnv
 from smallsat_sim.planners.base_planner import BasePlanner
 
 from scipy.spatial.transform import Rotation as R
+
+from smallsat_sim.envs.rendering.rollout import add_visualization_args
 
 
 def get_args() -> argparse.Namespace:
@@ -32,6 +38,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb", action="store_true", help="Use Weights & Biases to log RL data"
     )
+
+    add_visualization_args(parser)
 
     # Parse the arguments
     args = parser.parse_args()
@@ -63,47 +71,6 @@ def refModel3(x_d, v_d, a_d, r, wn_d, zeta_d, v_max, sampleTime):
     return x_d, v_d, a_d
 
 
-def Tquat(q: jnp.ndarray) -> jnp.ndarray:
-    """Tq = Tquat(q) computes the quaternion transformation matrix Tq of
-    dimension 4 x 3 for attitude such that q_dot = Tq * w
-    """
-    if len(q) == 4:
-        eta = q[0]
-        eps1 = q[1]
-        eps2 = q[2]
-        eps3 = q[3]
-
-        T = 0.5 * jnp.array(
-            [
-                [-eps1, -eps2, -eps3],
-                [eta, -eps3, eps2],
-                [eps3, eta, -eps1],
-                [-eps2, eps1, eta],
-            ]
-        )
-
-    else:
-        raise ValueError("input must be of dim. 4 (unit quaternion)")
-    return T
-
-
-def Rquat(q: jnp.ndarray) -> jnp.ndarray:
-    """R = Rquat(q) computes the rotation matrix R of dimension 3 x 3
-    for attitude from a quaternion q.
-    """
-    q = q.flatten()
-    if len(q) == 4:
-        eta = q[0]
-        eps = q[1:4]
-
-        S = skew(eps)
-        R = jnp.eye(3) + 2 * eta * S + 2 * S @ S
-
-    else:
-        raise ValueError("input must be of dim. 4 (unit quaternion)")
-    return R
-
-
 def skew(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.array([[0, -x[2], x[1]], [x[2], 0, -x[0]], [-x[1], x[0], 0]])
 
@@ -115,46 +82,6 @@ def sgn_quat(x: float) -> int:
     else:
         sgn = -1
     return sgn
-
-
-def quat_multiply(q1: jnp.ndarray, q2: jnp.ndarray) -> jnp.ndarray:
-    """q = quat_multiply(q1,q2) computes the quaternion product q of
-    two quaternions q1 and q2.
-    """
-    if len(q1) == 4 and len(q2) == 4:
-        eta1 = q1[0]
-        eps1_1 = q1[1]
-        eps1_2 = q1[2]
-        eps1_3 = q1[3]
-
-        eta2 = q2[0]
-        eps2_1 = q2[1]
-        eps2_2 = q2[2]
-        eps2_3 = q2[3]
-
-        q = jnp.array(
-            [
-                eta1 * eta2 - eps1_1 * eps2_1 - eps1_2 * eps2_2 - eps1_3 * eps2_3,
-                eta1 * eps2_1 + eps1_1 * eta2 + eps1_2 * eps2_3 - eps1_3 * eps2_2,
-                eta1 * eps2_2 - eps1_1 * eps2_3 + eps1_2 * eta2 + eps1_3 * eps2_1,
-                eta1 * eps2_3 + eps1_1 * eps2_2 - eps1_2 * eps2_1 + eps1_3 * eta2,
-            ]
-        )
-
-    else:
-        raise ValueError("input must be of dim. 4 (unit quaternion)")
-    return q
-
-
-def quat_conjugate(q) -> jnp.ndarray:
-    """q_conj = quat_conjugate(q) computes the quaternion conjugate
-    q_conj of a quaternion q.
-    """
-    if len(q) == 4:
-        q_conj = jnp.array([q[0], -q[1], -q[2], -q[3]])
-    else:
-        raise ValueError("input must be of dim. 4 (unit quaternion)")
-    return q_conj
 
 
 def discount_cumsum(x, discount) -> jnp.ndarray:
@@ -358,3 +285,12 @@ def scale_rews(rews: jnp.ndarray, ep_rets: jnp.ndarray, step: int) -> jnp.ndarra
     Scale the rewards along a trajectory.
     """
     return rews / (ep_rets[:, : step + 1].std(axis=1) + 1e-8)
+
+
+
+def Rquat(q):
+    return quaternion_to_rotation_matrix(q.flatten(), normalize=False)
+
+
+def Tquat(q):
+    return quaternion_rate_matrix(q, normalize=False)

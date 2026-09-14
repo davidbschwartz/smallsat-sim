@@ -1,3 +1,5 @@
+"""Run classical controllers on the Astrobee environment."""
+
 import time
 from smallsat_sim.utils.helpers import get_args
 
@@ -6,7 +8,7 @@ from smallsat_sim.controllers.nominal_mpc.controller import NominalMPCController
 from smallsat_sim.controllers.mpcc.controller import NominalMPCCController
 from smallsat_sim.controllers.lqr.controller import LQRController
 from smallsat_sim.controllers.gp_mpc.controller import GPMPC
-from smallsat_sim.envs.astrobee.env import AstrobeeEnv
+from smallsat_sim.envs.vehicles.astrobee.env import AstrobeeEnv
 
 from smallsat_sim.planners.oracle.oracle import OraclePlanner
 from smallsat_sim.planners.mission.mission import MissionPlanner

@@ -1,14 +1,16 @@
+"""Stuck-on thruster sampling and reset tests."""
+
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 
-from smallsat_sim.envs.perturbations_rl import Perturbation, StuckOnThrusters
+from smallsat_sim.envs.effects.preparation import StuckOnThrusters
 
 
 def _make_env_cfg(num_envs: int):
     return SimpleNamespace(
-        control=SimpleNamespace(RL=SimpleNamespace(num_envs=num_envs)),
+        environment=SimpleNamespace(num_envs=num_envs),
         sim=SimpleNamespace(verbose=False),
     )
 
@@ -16,15 +18,11 @@ def _make_env_cfg(num_envs: int):
 def _make_model_cfg(forceranges: list[tuple[float, float]]):
     thruster_list = [SimpleNamespace(forcerange=fr) for fr in forceranges]
     return SimpleNamespace(
-        Thrusters=SimpleNamespace(
-            n_thrusters=len(forceranges),
-            thruster_list=thruster_list,
-        )
+        actuators=thruster_list
     )
 
 
-def test_stuck_on_samples_uniform_force_within_thruster_range() -> None:
-    Perturbation.thruster_mask = None
+def test_stuck_on_samples_force_within_each_thruster_range() -> None:
     forceranges = [(0.1, 1.0), (0.2, 0.9)]
     pert = StuckOnThrusters(
         _make_env_cfg(num_envs=2),

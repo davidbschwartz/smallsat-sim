@@ -1,9 +1,11 @@
+"""Run classical controllers on the CubeSat environment."""
+
 import time
 from smallsat_sim.utils.helpers import get_args
 from smallsat_sim.controllers.pd.controller import PDController
 from smallsat_sim.controllers.nominal_mpc.controller import NominalMPCController
 from smallsat_sim.controllers.lqr.controller import LQRController
-from smallsat_sim.envs.cubesat.env import CubesatEnv
+from smallsat_sim.envs.vehicles.cubesat.env import CubesatEnv
 from smallsat_sim.planners.oracle.oracle import OraclePlanner
 
 # Get arguments for script execution

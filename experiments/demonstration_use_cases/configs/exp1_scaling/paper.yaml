@@ -1,0 +1,16 @@
+experiment: exp1_scaling
+batch_sizes:
+- 1
+- 8
+- 32
+- 128
+- 512
+- 1024
+- 2048
+- 4096
+rollout_steps: 512
+repeats: 10
+warmups: 2
+backend: freeflyer
+require_gpu: true
+spacecraft: astrobee

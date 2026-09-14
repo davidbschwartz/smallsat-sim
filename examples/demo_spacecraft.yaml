@@ -1,0 +1,168 @@
+# Physical asset definition: geometry, mass, inertia and actuators.
+name: demo_spacecraft
+bodies:
+- name: body0
+  pos: [0.0, 0.0, 0.0]
+  euler: [0.0, 0.0, 0.0]
+actuators:
+- name: thruster1
+  pos: [0.05, 0.025, 0.05]
+  gear: [1, 0, 0]
+  site: thruster1
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster2
+  pos: [-0.05, 0.025, -0.05]
+  gear: [-1, 0, 0]
+  site: thruster2
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster3
+  pos: [0.05, -0.025, -0.05]
+  gear: [1, 0, 0]
+  site: thruster3
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster4
+  pos: [-0.05, -0.025, 0.05]
+  gear: [-1, 0, 0]
+  site: thruster4
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster5
+  pos: [0.025, 0.05, 0.05]
+  gear: [0, 1, 0]
+  site: thruster5
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster6
+  pos: [0.025, -0.05, -0.05]
+  gear: [0, -1, 0]
+  site: thruster6
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster7
+  pos: [-0.025, 0.05, -0.05]
+  gear: [0, 1, 0]
+  site: thruster7
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster8
+  pos: [-0.025, -0.05, 0.05]
+  gear: [0, -1, 0]
+  site: thruster8
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster9
+  pos: [-0.025, -0.025, 0.143]
+  gear: [0, 0, 1]
+  site: thruster9
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster10
+  pos: [0.025, -0.025, -0.15]
+  gear: [0, 0, -1]
+  site: thruster10
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster11
+  pos: [0.025, 0.025, 0.143]
+  gear: [0, 0, 1]
+  site: thruster11
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+- name: thruster12
+  pos: [-0.025, 0.025, -0.15]
+  gear: [0, 0, -1]
+  site: thruster12
+  forcerange: [0, 0.4]
+  ctrlrange: [0, 0.4]
+  forcelimited: 'false'
+  ctrllimited: 'false'
+  size: 0.005
+geoms:
+- name: cubesat_top
+  type: mesh
+  pos: [-0.0495, -0.0495, 0.1395]
+  euler: [0, 0, 0]
+  mesh: cubesat/meshes/cubesat_top.stl
+  asset_scale: [0.001, 0.001, 0.001]
+  size: [1, 1, 1]
+- name: cubesat_middle
+  type: mesh
+  pos: [-0.05, -0.05, -0.15]
+  euler: [0, 0, 0]
+  mesh: cubesat/meshes/cubesat_middle.stl
+  asset_scale: [0.001, 0.001, 0.001]
+  size: [1, 1, 1]
+- name: cubesat_middle
+  type: mesh
+  pos: [-0.05, -0.05, -0.0535]
+  euler: [0, 0, 0]
+  mesh: cubesat/meshes/cubesat_middle.stl
+  asset_scale: [0.001, 0.001, 0.001]
+  size: [1, 1, 1]
+- name: cubesat_middle
+  type: mesh
+  pos: [-0.05, -0.05, 0.043]
+  euler: [0, 0, 0]
+  mesh: cubesat/meshes/cubesat_middle.stl
+  asset_scale: [0.001, 0.001, 0.001]
+  size: [1, 1, 1]
+- name: cubesat_bottom
+  type: mesh
+  pos: [-0.05, -0.05, -0.15]
+  euler: [0, 0, 0]
+  mesh: cubesat/meshes/cubesat_bottom.stl
+  asset_scale: [0.001, 0.001, 0.001]
+  size: [1, 1, 1]
+physical:
+  length: 0.1
+  width: 0.1
+  height: 0.3
+  mass: 4.0
+  diag_inertia: [0.033, 0.033, 0.007]
+  com_offset: [0, 0, 0]
+  density: 1000.0
+assets:
+  kind: generic
+  meshes: []
+  materials: {}
+  metadata: {}
+default_env: null
+default_model: cubesat
+metadata:
+  legacy_model_name: cubesat

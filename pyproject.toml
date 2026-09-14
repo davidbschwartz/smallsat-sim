@@ -1,18 +1,21 @@
 [build-system]
-requires = ["setuptools>=42,<81"]
+requires = ["setuptools>=77,<81"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "smallsat_sim"  # Replace with your package name
+name = "smallsat_sim"
 version = "1.0.0"
-description = "SmallSatSim"
+description = "Microgravity robotics simulation, spacecraft control, and batched policy learning"
+readme = "README.md"
+license = "Apache-2.0"
 
 dependencies = [
     "casadi==3.6.7",
     "numpy==2.2.6",
     "pyyaml==6.0.1",
-    "mujoco==3.3.7",
-    "mujoco-mjx==3.3.7",
+    "mujoco==3.9.0",
+    "mujoco-mjx==3.9.0",
+    "viser==1.0.30",
     "glfw==2.8.0",
     "opencv-python==4.12.0.88",
     "scipy==1.15.3",
@@ -20,21 +23,81 @@ dependencies = [
     "h5py==3.12.1",
     "pandas==2.3.3",
     "psutil==6.1.0",
-    "gpytorch==1.13", 
+    "gpytorch @ git+https://github.com/naefjo/gpytorch.git@7a30ef164ea01e3cd9a27ab6c4872a2aed73d8f3", # Pinned online-learning fork below, shared with the MPC stack.
+    "linear-operator @ git+https://github.com/naefjo/linear_operator.git@fc062601ea9cc82d6abce0190bf0071fd8c54c10",
     "jax==0.6.2",
-    "pytest==8.4.2",
     "optax==0.2.6",
     "flax==0.10.7",
     "distrax==0.1.5",
     "gpjax==0.12.2",
     "wandb==0.20.0",
-    "warp-lang==1.9.1",
+    "orbax-checkpoint==0.11.32",
+    "mjviser==0.0.14",
+    "trimesh==4.11.1", # Browser clearance meshes; already pinned transitively by mjviser.
 ]
 
 requires-python = ">=3.10"
 
+[project.urls]
+Homepage = "https://smallsatsim.github.io"
+
 [project.optional-dependencies]
+paper = ["matplotlib==3.10.8"]
 cuda12 = ["jax[cuda12]"]
+warp = ["mujoco-mjx[warp]==3.9.0"]
+mpc = [
+    "acados-template @ git+https://github.com/acados/acados.git@5f01e9c8d756f88957a3a2e54923ce5ebc219a81#subdirectory=interfaces/acados_template",
+    "l4acados[pytorch,gpytorch] @ git+https://github.com/IntelligentControlSystems/l4acados.git@e26ab16fc73a554a1773cc3c491f7b8a848cb935",
+    "gpytorch @ git+https://github.com/naefjo/gpytorch.git@7a30ef164ea01e3cd9a27ab6c4872a2aed73d8f3",
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "linear-operator @ git+https://github.com/naefjo/linear_operator.git@fc062601ea9cc82d6abce0190bf0071fd8c54c10",
+    "setuptools<81", # acados 0.4.1 uses pkg_resources at runtime.
+]
+
+[dependency-groups]
+dev = [
+    "setuptools>=77,<81", # Build and inspect release wheels.
+    "pytest==8.4.2",
+    "ruff>=0.13.2",
+]
+
+[tool.uv.sources]
+acados-template = { git = "https://github.com/acados/acados.git", rev = "5f01e9c8d756f88957a3a2e54923ce5ebc219a81", subdirectory = "interfaces/acados_template" }
+l4acados = { git = "https://github.com/IntelligentControlSystems/l4acados.git", rev = "e26ab16fc73a554a1773cc3c491f7b8a848cb935" }
+# Same forks as l4acados[gpytorch-exo], pinned instead of following moving branches.
+gpytorch = { git = "https://github.com/naefjo/gpytorch.git", rev = "7a30ef164ea01e3cd9a27ab6c4872a2aed73d8f3" }
+linear-operator = { git = "https://github.com/naefjo/linear_operator.git", rev = "fc062601ea9cc82d6abce0190bf0071fd8c54c10" }
 
 [tool.setuptools.packages.find]
 where = ["src"]  # Source directory for the package
+include = ["smallsat_sim*"]
+
+[tool.setuptools.package-data]
+smallsat_sim = ["config/**/*.yaml", "config/*.yaml", "model/xml/*.xml",
+    "model/astrobee/meshes/*.obj", "model/astrobee/meshes/*.png", "model/astrobee/meshes/*.mtl",
+    "model/cubesat/meshes/*.STL",
+    "model/gateway/*.obj", "model/gateway/*.png", "model/gateway/*.mtl",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "experiments", "examples"]
+extend-exclude = [
+    "build",
+    "wandb",
+]
+
+[tool.ruff.lint]
+select = [
+    "F",
+]
+ignore = [
+    "F401",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"experiments/**/*.py" = ["E402"]
+"examples/**/*.py" = ["E402"]
+"src/tests/**/*.py" = ["E402"]

@@ -1,681 +1,180 @@
-import os
-import time
+"""Supervised context learning on trajectories induced by the current estimator."""
 
+from functools import partial
+from pathlib import Path
+
+from flax import nnx
 import jax
 import jax.numpy as jnp
-from flax import nnx
-import optax
-import wandb
 
-from smallsat_sim.controllers.rl.runners.rollout import (
-    AdaptationRolloutExtra,
-    FunctionalRolloutCallbacks,
-    prepare_policy_input_with_residuals,
-    residuals_from_wrench_delta,
-    run_functional_rollout,
-    update_history_buffer,
-)
-from smallsat_sim.controllers.rl.runners.adaptive_context import (
-    build_adaptation_query,
-    task_authority_targets,
-)
-from smallsat_sim.controllers.rl.runners.curriculum import (
-    build_authority_regime_curriculum_v2,
-    build_residual_policy_curriculum,
-    phase_failure_fraction as get_phase_failure_fraction,
-    uniform_failure_distribution,
-)
-from smallsat_sim.controllers.rl.runners.failure_scenarios import (
-    SPLIT_TRAIN,
-    apply_sampled_failure_scenario_split,
-    build_failure_scenario_table,
-    precompute_scenario_gp_samples,
-    task_wrench_from_state_features,
-)
-from smallsat_sim.controllers.rl.runners.runner_utils import (
+from .runner_metrics import report
+from .runner_utils import (
+    checkpoint_exists,
     load_trained_modules,
-    save_adaptation_module,
-)
-from smallsat_sim.envs.vec_env import _compute_state_features
-from smallsat_sim.utils.helpers_jax import (
-    calc_attitude_error,
-    calc_extrinsic_error,
-    calc_lateral_tracking_error,
-    train_val_split,
+    restore_trained_modules,
+    model_fingerprint,
 )
 
 
-def train_adaptation_module_on_policy_runner(self) -> None:
-    """
-    Train adaptation module to predict extrinsics from the history of states and actions with
-    on-policy data (RMA approach).
-    NOTE: use_adaptive_approach must be set to True in the environment config.
-    """
-    if self.env.use_adaptive_approach is False:
-        return
+def gather_windows(features, targets, indices, history_len):
+    # Indices end at the completed transition whose context is the target.
+    time, env = indices[:, 0], indices[:, 1]
+    offsets = jnp.arange(history_len) - history_len + 1
+    return features[time[:, None] + offsets, env[:, None]], targets[time, env]
 
-    file_path = os.path.join(self.ckpt_dir, self.adaptation_module_file_name)
-    if os.path.isfile(file_path):
-        return
 
-    file_path = os.path.join(self.ckpt_dir, self.training_state_file_name)
-    if os.path.isfile(file_path):
-        restored_state = load_trained_modules(
-            self.ckpt_dir, self.training_state_file_name
+@partial(jax.jit, static_argnames=("graph", "history_len", "batch_size", "updates"))
+def adaptation_updates(
+    graph, state, features, targets, full, key, *, history_len, batch_size, updates
+):
+    """Split by environment before sampling windows; no overlapping split leakage."""
+    # Separate environments before drawing overlapping history windows.
+    env_count = features.shape[1]
+    split = max(1, min(env_count - 1, int(0.8 * env_count)))
+    env_ids = jnp.arange(env_count)[None, :]
+    time_ids = jnp.arange(features.shape[0])[:, None]
+    valid = full & (time_ids >= history_len - 1)
+    train_mask = valid & (env_ids < split)
+    val_mask = valid & (env_ids >= split)
+
+    def draw(mask, key):
+        # Fixed output shape even when episodes have different lengths.
+        cumulative = jnp.cumsum(mask.reshape(-1), dtype=jnp.int32)
+        ranks = jax.random.randint(
+            key, (batch_size,), 0, jnp.maximum(cumulative[-1], 1)
         )
-        actor_state = restored_state["actor_model"]
-        critic_state = restored_state["critic_model"]
-        if isinstance(actor_state, dict):
-            nnx.update(self.agent.actor, actor_state)
-        else:
-            nnx.update(self.agent.actor.mu_net, actor_state.mu_net)
-        if isinstance(critic_state, dict):
-            nnx.update(self.agent.critic, critic_state)
-        else:
-            nnx.update(self.agent.critic.v_net, critic_state.v_net)
-    else:
-        raise Exception(
-            "The base policy must be trained before the adaptation module."
-        )
+        flat = jnp.searchsorted(cumulative, ranks, side="right")
+        flat = jnp.minimum(flat, mask.size - 1)
+        indices = jnp.stack((flat // env_count, flat % env_count), axis=-1)
+        return gather_windows(features, targets, indices, history_len)
 
-    print("Training adaptation module...\n")
+    def loss(model, x, y):
+        return jnp.square(model(x) - y).mean()
 
-    self.env.reset()
-    self.env.reset_perturbations()
-    if hasattr(self.env, "reset_disturbances"):
-        self.env.reset_disturbances()
+    def update(state, key):
+        model, optimizer = nnx.merge(graph, state)
+        x, y = draw(train_mask, key)
+        value, grads = nnx.value_and_grad(loss)(model, x, y)
+        optimizer.update(grads)
+        return nnx.state((model, optimizer)), value
 
-    subkeys_train = self._take_keys(self.epochs)
-
-    cfg = self.env.env_cfg.control.RL
-    am_lr = self.env.env_cfg.control.RL.am_lr
-    am_weight_decay = self.env.env_cfg.control.RL.am_weight_decay
-    grad_clip_norm = max(float(self.env.env_cfg.control.RL.am_grad_clip_norm), 1e-6)
-    am_optax = optax.chain(
-        optax.clip_by_global_norm(grad_clip_norm),
-        optax.adamw(
-            learning_rate=am_lr,
-            eps=1e-8,
-            weight_decay=am_weight_decay,
-        ),
+    train_key, val_key = jax.random.split(key)
+    state, losses = jax.lax.cond(
+        jnp.any(train_mask),
+        lambda s: jax.lax.scan(update, s, jax.random.split(train_key, updates)),
+        lambda s: (s, jnp.zeros((updates,))),
+        state,
     )
-    am_checkpoint_interval = int(getattr(cfg, "am_checkpoint_interval", 10))
-    am_checkpoint_interval = max(1, am_checkpoint_interval)
-    self.am_optimizer = nnx.Optimizer(self.am, am_optax)
+    model, _ = nnx.merge(graph, state)
+    x, y = draw(val_mask, val_key)
+    val_loss = jnp.where(jnp.any(val_mask), loss(model, x, y), jnp.nan)
+    return state, {
+        "am_train_loss_mean": losses.mean(),
+        "am_val_loss_mean": val_loss,
+        "train_windows": train_mask.sum(),
+        "validation_windows": val_mask.sum(),
+    }
 
-    num_envs = self.env.num_envs
-    history_len = self.env.history_len
-    state_action_dim = self.state_action_dim
-    failure_start_time_min = float(
-        getattr(cfg, "curriculum_failure_start_time_min", 0.0)
-    )
-    failure_start_time_max = float(
-        getattr(cfg, "curriculum_failure_start_time_max", 0.0)
-    )
-    disturbance_start_time_min = float(
-        getattr(cfg, "curriculum_disturbance_start_time_min", 0.0)
-    )
-    disturbance_start_time_max = float(
-        getattr(cfg, "curriculum_disturbance_start_time_max", 0.0)
-    )
-    curriculum_mode = str(getattr(cfg, "failure_curriculum_mode", "authority"))
-    use_controllable_failure_scenarios = bool(
-        getattr(cfg, "use_controllable_failure_scenarios", False)
-    ) and bool(self.env.train_with_failures)
-    failure_scenario_table = None
-    use_task_conditioned_failure_sampling = bool(
-        getattr(cfg, "use_task_conditioned_failure_sampling", True)
-    )
-    if use_controllable_failure_scenarios:
-        failure_scenario_table = build_failure_scenario_table(
-            self.env._thruster_mixer_T,
-            self.agent.actor.act_low,
-            self.agent.actor.act_high,
-            max_faults=int(getattr(cfg, "failure_scenario_max_faults", 12)),
-            exhaustive_faults=int(
-                getattr(cfg, "failure_scenario_exhaustive_faults", 2)
-            ),
-            sampled_per_fault_count=int(
-                getattr(cfg, "failure_scenario_sampled_per_fault_count", 512)
-            ),
-            min_rank=int(getattr(cfg, "failure_scenario_min_rank", 6)),
-            stress_quantile=float(
-                getattr(cfg, "failure_scenario_stress_quantile", 0.9)
-            ),
-            mild_effectiveness=float(
-                getattr(cfg, "failure_scenario_mild_effectiveness", 0.5)
-            ),
-        )
-        precompute_scenario_gp_samples(self.env, self._take_keys())
 
-    if curriculum_mode not in ("authority", "semantic"):
-        print(
-            f"[AM Curriculum] mode='{curriculum_mode}' is deprecated; using semantic authority curriculum.",
-            flush=True,
+def train_adaptation_module_on_policy_runner(runner, *, mode="fresh"):
+    if runner.am is None:
+        raise ValueError("Adaptation requires an adaptive PPO run")
+    if runner.env.num_envs < 2:
+        raise ValueError(
+            "Adaptation requires at least two environments for train/validation separation"
         )
-    adaptive_policy_mode = str(getattr(self.env, "adaptive_policy_mode", "direct"))
-    if adaptive_policy_mode == "residual":
-        curriculum_phases, curriculum_total_epochs = build_residual_policy_curriculum(
-            train_with_failures=bool(self.env.train_with_failures),
-            fallback_epochs=int(self.epochs),
+    if runner.agent.steps_per_epoch < runner.env.history_len:
+        raise ValueError("Rollout must contain at least one full history")
+
+    # The policy is fixed throughout this stage; only estimator weights change.
+    start_epoch = runner.begin("adaptation", mode)
+    collector = runner.collector("estimated", stochastic=False)
+    for epoch in range(start_epoch, runner.training_cfg.am_collection_epochs):
+        result = runner.collect(collector, randomize=runner.env.train_with_failures)
+        features = jnp.concatenate(
+            (result.step_outputs.prev_states, result.actions), axis=-1
         )
-    else:
-        curriculum_phases, curriculum_total_epochs = (
-            build_authority_regime_curriculum_v2(
-                train_with_failures=bool(self.env.train_with_failures),
-                fallback_epochs=int(self.epochs),
-                nominal_epochs=int(cfg.curriculum_nominal_epochs),
-                phase_epochs=int(cfg.curriculum_phase_epochs),
-                failure_fraction=float(cfg.curriculum_failure_fraction),
-                disturbance_fraction=float(cfg.curriculum_disturbance_fraction),
+        objects = (runner.am, runner.am_optimizer)
+        graph, state = nnx.split(objects)
+        state, metrics = adaptation_updates(
+            graph,
+            state,
+            features,
+            result.labels.normalized_context,
+            result.labels.history_full,
+            runner._take_keys(),
+            history_len=runner.env.history_len,
+            batch_size=runner.training_cfg.am_batch_size,
+            updates=runner.training_cfg.am_epochs,
+        )
+        nnx.update(objects, state)
+        values = report(runner, "am_training", epoch + 1, metrics)
+        if values["train_windows"] == 0 or values["validation_windows"] == 0:
+            raise ValueError(
+                "No complete adaptation histories in a split; increase the horizon or shorten history"
             )
-        )
-    phase_end_epochs = []
-    running_epoch = 0
-    for phase in curriculum_phases:
-        running_epoch += int(phase["epochs"])
-        phase_end_epochs.append(running_epoch)
+        runner.adaptation_epoch = epoch + 1
+        if (epoch + 1) % runner.training_cfg.am_checkpoint_interval == 0:
+            runner.save("adaptation")
+    runner.save("adaptation")
 
-    def _sample_start_time(key, low: float, high: float) -> float:
-        if high <= low:
-            return low
-        return float(jax.random.uniform(key, (), minval=low, maxval=high))
 
-    def _phase_for_am_epoch(epoch: int) -> dict:
-        # Project AM collection epochs onto the policy curriculum timeline.
-        scaled_epoch = int(epoch * curriculum_total_epochs / max(int(self.epochs), 1))
-        scaled_epoch = min(max(scaled_epoch, 0), curriculum_total_epochs - 1)
-        for phase, end_epoch in zip(curriculum_phases, phase_end_epochs, strict=True):
-            if scaled_epoch < end_epoch:
-                return phase
-        return curriculum_phases[-1]
-
-    for epoch in range(self.epochs):
-        epoch_start_time = time.perf_counter()
-        self.env.reset_perturbations()
-        if hasattr(self.env, "reset_disturbances"):
-            self.env.reset_disturbances()
-        phase = _phase_for_am_epoch(epoch)
-        phase_failure_fraction = get_phase_failure_fraction(
-            phase, int(epoch * curriculum_total_epochs / max(int(self.epochs), 1))
-        )
-        phase_disturbance_fraction = float(phase["disturbance_fraction"])
-        phase_difficulty_bin = phase.get("difficulty_bin")
-        phase_authority_regime = phase.get("authority_regime")
-        phase_task_feasibility_regime = phase.get("task_feasibility_regime")
-        phase_failure_sampling_mix = phase.get("failure_sampling_mix")
-        phase_distribution = uniform_failure_distribution(
-            list(phase["active_failures"])
-        )
-        (
-            perturb_key,
-            disturb_key,
-            failure_onset_key,
-            disturbance_onset_key,
-        ) = jax.random.split(subkeys_train[epoch], 4)
-        failure_start_time = _sample_start_time(
-            failure_onset_key,
-            failure_start_time_min,
-            failure_start_time_max,
-        )
-        disturbance_start_time = _sample_start_time(
-            disturbance_onset_key,
-            disturbance_start_time_min,
-            disturbance_start_time_max,
-        )
-        if phase_failure_fraction > 0.0:
-            if (
-                use_controllable_failure_scenarios
-                and failure_scenario_table is not None
-            ):
-                current_task_wrenches = None
-                if use_task_conditioned_failure_sampling:
-                    current_states = _compute_state_features(
-                        self.env.state_struct.mjx_batch,
-                        self.reference_point,
-                    )
-                    pd_gains = self.env.env_cfg.control.PD.gains
-                    current_task_wrenches = task_wrench_from_state_features(
-                        current_states,
-                        kp_pos=float(getattr(pd_gains, "Kp_x", 0.2)),
-                        kd_pos=float(getattr(pd_gains, "Kd_x", 1.0)),
-                        kp_att=float(getattr(pd_gains, "Kp_q", 3.0)),
-                        kd_att=float(getattr(pd_gains, "Kd_q", 5.0)),
-                    )
-                apply_sampled_failure_scenario_split(
-                    self.env,
-                    key=perturb_key,
-                    table=failure_scenario_table,
-                    split_id=SPLIT_TRAIN,
-                    fraction_perturbed_envs=phase_failure_fraction,
-                    start_time=failure_start_time,
-                    difficulty_bin=phase_difficulty_bin,
-                    authority_regime=phase_authority_regime,
-                    task_feasibility_regime=phase_task_feasibility_regime,
-                    failure_sampling_mix=phase_failure_sampling_mix,
-                    task_wrenches=current_task_wrenches,
-                    apply_constant_disturbance_scenarios=phase_disturbance_fraction > 0.0,
-                )
-            else:
-                self.env.apply_random_perturbations(
-                    key=perturb_key,
-                    fraction_perturbed_envs=phase_failure_fraction,
-                    perturbation_distribution=phase_distribution,
-                    start_time=failure_start_time,
-                )
-        if phase_disturbance_fraction > 0.0:
-            self.env.apply_random_disturbance(
-                key=disturb_key,
-                fraction_disturbed_envs=phase_disturbance_fraction,
-                start_time=disturbance_start_time,
+def initialize_from_teacher(runner, checkpoint):
+    """Copy a fixed teacher into a new adaptation run; ordinary resume stays strict."""
+    if runner.am is None or runner.agent.algorithm != "ppo":
+        raise ValueError("A shared teacher requires an adaptive PPO run")
+    for stage in ("policy", "adaptation"):
+        if checkpoint_exists(runner.ckpt_dir, runner._filename(stage)):
+            raise FileExistsError(
+                "Initialize a teacher only in a new run directory/name"
             )
 
-        step_config = self.env.build_step_config(max_episode_len=self.max_ep_len)
-        vec_state = self.env.state_struct
-        actor_state, critic_state = self.agent.actor_critic_state()
+    checkpoint = Path(checkpoint).resolve()
+    payload = load_trained_modules(checkpoint.parent, checkpoint.name)
+    metadata = payload["metadata"]
+    if metadata.get("stage") != "policy":
+        raise ValueError("The teacher must be a policy-stage checkpoint")
 
-        def _prepare_policy_input(_step, states, residuals, carry_extra):
-            return prepare_policy_input_with_residuals(
-                _step, states, residuals, carry_extra
-            )
+    # Estimator choices and output locations may differ; policy, physics and task may not.
+    estimator_settings = {
+        "am_architecture",
+        "context_window_len",
+        "am_epochs",
+        "am_collection_epochs",
+        "am_lr",
+        "am_batch_size",
+        "am_checkpoint_interval",
+        "checkpoint_dir",
+        "rl_run_id",
+    }
 
-        def _sample_policy(_step, policy_input, rng_key, carry_extra):
-            del _step  # unused
-            actions = self.agent.get_control_input("am_training", policy_input)
-            values = jnp.zeros((num_envs,), dtype=jnp.float32)
-            logp = jnp.zeros((num_envs,), dtype=jnp.float32)
-            return actions, values, logp, rng_key, carry_extra
+    def teacher_contract(config):
+        return {
+            **config,
+            "rl": {
+                name: value
+                for name, value in config["rl"].items()
+                if name not in estimator_settings
+            },
+        }
 
-        def _post_step(
-            _step, step_output, actions, residuals, reset_flag, carry_extra
-        ):
-            del _step
-            _, _, history_full, new_extra = update_history_buffer(
-                carry_extra=carry_extra,
-                prev_states=step_output.prev_states,
-                actions=actions,
-                reset_flag=reset_flag,
-                history_len=history_len,
-            )
-            residuals_next = residuals_from_wrench_delta(
-                step_output=step_output,
-                residuals=residuals,
-                use_adaptive_approach=True,
-                adaptive_context_mode=self.env.adaptive_context_mode,
-                thruster_mixer_T=self.env._thruster_mixer_T,
-            )
-            return residuals_next, history_full, new_extra
-
-        def _bootstrap_value(step_idx, env_state, residuals, rng_key, carry_extra):
-            rng_key, value_key = jax.random.split(rng_key)
-            next_states = _compute_state_features(
-                env_state.mjx_batch, self.reference_point
-            )
-            policy_input, carry_extra = _prepare_policy_input(
-                step_idx, next_states, residuals, carry_extra
-            )
-            _, values, _ = self.agent.functional_act(
-                actor_state,
-                critic_state,
-                policy_input,
-                value_key,
-            )
-            return values, rng_key, carry_extra
-
-        extra = AdaptationRolloutExtra(
-            history=jnp.zeros((num_envs, history_len, state_action_dim)),
-            counts=jnp.zeros((num_envs,), dtype=jnp.int32),
+    if teacher_contract(metadata["resolved_config"]) != teacher_contract(
+        runner.resolved_config
+    ):
+        raise ValueError(
+            "Teacher policy, physics or task configuration differs from this run"
         )
 
-        rollout_start_time = time.perf_counter()
-        rollout_result = run_functional_rollout(
-            step_config=step_config,
-            initial_state=vec_state,
-            initial_residuals=jnp.zeros((num_envs, self.env.res_dim)),
-            rng=self.agent.key,
-            num_steps=self.steps_per_epoch,
-            reference_waypoint=self.reference_point,
-            callbacks=FunctionalRolloutCallbacks(
-                prepare_policy_input=_prepare_policy_input,
-                sample_policy=_sample_policy,
-                post_step=_post_step,
-                bootstrap_value=_bootstrap_value,
-            ),
-            extra=extra,
-        )
-
-        jax.block_until_ready(rollout_result.actions)
-        rollout_duration = time.perf_counter() - rollout_start_time
-        self.agent.key = rollout_result.final_rng
-
-        target_start_time = time.perf_counter()
-        step_outputs = rollout_result.step_outputs
-        actions_traj = rollout_result.actions
-        next_obs = step_outputs.next_obs
-        history_mask = rollout_result.aux.astype(bool)
-        done_masks = rollout_result.done_masks
-
-        state_action_data = jnp.concatenate(
-            [step_outputs.prev_states, actions_traj], axis=2
-        )
-        query_data = build_adaptation_query(
-            states=step_outputs.prev_states.reshape(-1, self.env.obs_dim),
-            desired_wrench=step_outputs.desired_wrench.reshape(-1, 6),
-            use_task_conditioned_am=self.env.use_task_conditioned_am,
-        ).reshape(self.steps_per_epoch, num_envs, self.env.am_query_dim)
-        # Actual/applied force information is used only to build supervised
-        # target labels. The AM input remains measured state, requested action,
-        # and requested task wrench.
-        extrinsics = rollout_result.residuals
-        delta_states = step_outputs.next_states - step_outputs.prev_states
-        tracking_targets = calc_lateral_tracking_error(
-            next_obs.reshape(-1, next_obs.shape[-1]), self.planner
-        ).reshape(self.steps_per_epoch, num_envs, 1)
-        authority_targets = task_authority_targets(
-            commanded_ctrl=step_outputs.commanded_ctrl.reshape(-1, self.env.act_dim),
-            applied_ctrl=step_outputs.applied_ctrl.reshape(-1, self.env.act_dim),
-            actual_wrench=step_outputs.actual_wrench.reshape(-1, 6),
-            desired_wrench=step_outputs.desired_wrench.reshape(-1, 6),
-        ).reshape(self.steps_per_epoch, num_envs, 3)
-        am_targets = jnp.concatenate(
-            [extrinsics, query_data, delta_states, tracking_targets, authority_targets],
-            axis=2,
-        )
-        state_action_data, am_targets = self._build_sliding_windows(
-            state_action_data,
-            am_targets,
-            history_mask,
-            history_len,
-        )
-        if state_action_data.shape[0] == 0:
-            print(
-                "Skipping adaptation module update: insufficient full-history samples."
-            )
-            continue
-
-        obs_flat = next_obs.reshape(-1, next_obs.shape[-1])
-        tracking_vals = calc_lateral_tracking_error(
-            obs_flat, self.planner
-        ).reshape(self.steps_per_epoch, num_envs)
-        angle_vals = jnp.degrees(calc_attitude_error(obs_flat)).reshape(
-            self.steps_per_epoch, num_envs
-        )
-        tracking_vals = tracking_vals.mean(axis=1)
-        angle_vals = angle_vals.mean(axis=1)
-
-        def _history_scan(carry, scan_inputs):
-            history, counts = carry
-            step_idx, prev_states_step, actions_step, desired_step, done_step = (
-                scan_inputs
-            )
-
-            combined = jnp.concatenate([prev_states_step, actions_step], axis=1)
-            history = jnp.roll(history, shift=-1, axis=1)
-            history = history.at[:, -1, :].set(combined)
-            counts = jnp.minimum(counts + 1, history_len)
-            history_full = counts >= history_len
-
-            query = build_adaptation_query(
-                states=prev_states_step,
-                desired_wrench=desired_step,
-                use_task_conditioned_am=self.env.use_task_conditioned_am,
-            )
-            extrinsic_est_raw = self.adaptation_module(history, query)
-            extrinsic_est = jnp.where(
-                history_full[:, None],
-                extrinsic_est_raw,
-                jnp.zeros_like(extrinsic_est_raw),
-            )
-            target_context_step = rollout_result.residuals[step_idx]
-            extrinsic_err = calc_extrinsic_error(
-                target_context_step,
-                extrinsic_est[:, : self.env.res_dim],
-            )
-            mask_f = history_full.astype(extrinsic_err.dtype)
-            extrinsic_mean = (extrinsic_err * mask_f).sum() / jnp.maximum(
-                mask_f.sum(), 1.0
-            )
-
-            reset_flag = jnp.logical_and(
-                done_step,
-                step_idx != (self.steps_per_epoch - 1),
-            )
-            history = jnp.where(
-                reset_flag[:, None, None],
-                jnp.zeros_like(history),
-                history,
-            )
-            counts = jnp.where(reset_flag, jnp.zeros_like(counts), counts)
-
-            return (history, counts), extrinsic_mean
-
-        scan_inputs = (
-            jnp.arange(self.steps_per_epoch, dtype=jnp.int32),
-            step_outputs.prev_states,
-            actions_traj,
-            step_outputs.desired_wrench,
-            done_masks,
-        )
-        init_history = jnp.zeros((num_envs, history_len, state_action_dim))
-        init_counts = jnp.zeros((num_envs,), dtype=jnp.int32)
-        (_, _), extrinsic_vals = jax.lax.scan(
-            _history_scan, (init_history, init_counts), scan_inputs
-        )
-
-        split_key = self._take_keys()
-        (
-            X_train,
-            y_train,
-            X_val,
-            y_val,
-            _,
-        ) = train_val_split(
-            state_action_data,
-            am_targets,
-            key=split_key,
-            shuffle=False,
-        )
-        target_duration = time.perf_counter() - target_start_time
-
-        update_start_time = time.perf_counter()
-        train_loss_sum = jnp.array(0.0, dtype=jnp.float32)
-        train_loss_count = 0
-        val_loss_sum = jnp.array(0.0, dtype=jnp.float32)
-        val_loss_count = 0
-        last_val_loss = None
-        am_train_loss_last = jnp.array(0.0, dtype=jnp.float32)
-
-        for nn_epoch in range(self.rl_cfg.am_epochs):
-            am_train_loss, grads = self.jitted_batched_am_loss_and_grad(
-                self.am,
-                X_train,
-                y_train,
-            )
-            am_train_loss_last = am_train_loss
-            train_loss_sum = train_loss_sum + am_train_loss
-            train_loss_count += 1
-            self.am_optimizer.update(grads)
-
-            if nn_epoch % 10 == 0:
-                am_val_loss = self.jitted_batched_am_loss_components(
-                    self.am, X_val, y_val
-                )[-1]
-                val_loss_sum = val_loss_sum + am_val_loss
-                val_loss_count += 1
-                last_val_loss = am_val_loss
-
-        mean_am_train_loss_arr = (
-            train_loss_sum / train_loss_count
-            if train_loss_count > 0
-            else jnp.array(0.0, dtype=jnp.float32)
-        )
-        mean_am_val_loss_arr = (
-            val_loss_sum / val_loss_count
-            if val_loss_count > 0
-            else jnp.array(0.0, dtype=jnp.float32)
-        )
-        jax.block_until_ready(am_train_loss_last)
-        update_duration = time.perf_counter() - update_start_time
-
-        metrics_start_time = time.perf_counter()
-        (
-            am_context_loss,
-            am_delta_loss,
-            am_tracking_loss,
-            am_authority_loss,
-            am_kl_loss,
-            am_total_loss,
-        ) = self.jitted_batched_am_loss_components(self.am, X_train, y_train)
-        (
-            am_val_context_loss,
-            am_val_delta_loss,
-            am_val_tracking_loss,
-            am_val_authority_loss,
-            am_val_kl_loss,
-            am_val_total_loss,
-        ) = self.jitted_batched_am_loss_components(self.am, X_val, y_val)
-        am_context_loss = float(am_context_loss)
-        am_delta_loss = float(am_delta_loss)
-        am_tracking_loss = float(am_tracking_loss)
-        am_authority_loss = float(am_authority_loss)
-        am_kl_loss = float(am_kl_loss)
-        am_total_loss = float(am_total_loss)
-        am_val_context_loss = float(am_val_context_loss)
-        am_val_delta_loss = float(am_val_delta_loss)
-        am_val_tracking_loss = float(am_val_tracking_loss)
-        am_val_authority_loss = float(am_val_authority_loss)
-        am_val_kl_loss = float(am_val_kl_loss)
-        am_val_total_loss = float(am_val_total_loss)
-        am_train_loss_value = float(am_train_loss_last)
-        mean_am_train_loss = float(mean_am_train_loss_arr)
-        last_val_loss_value = (
-            float(last_val_loss) if last_val_loss is not None else None
-        )
-        mean_am_val_loss = float(mean_am_val_loss_arr)
-        attention_metrics = {}
-        if self.env.am_architecture == "transformer_cross_attention":
-            query_dim = int(self.env.am_query_dim)
-            if query_dim > 0 and X_val.shape[0] > 0:
-                target_all_val = y_val[:, -1, :]
-                query_val = target_all_val[
-                    :, self.env.res_dim : self.env.res_dim + query_dim
-                ]
-                _, attention = jax.vmap(
-                    lambda hist, query_i: self.am(
-                        hist,
-                        query_i,
-                        return_attention=True,
-                    )
-                )(X_val, query_val)
-                attention_mean = attention.mean(axis=(0, 1))
-                time_axis = jnp.linspace(
-                    0.0,
-                    1.0,
-                    attention_mean.shape[0],
-                    dtype=attention_mean.dtype,
-                )
-                attention_entropy = -jnp.sum(
-                    attention_mean * jnp.log(attention_mean + 1e-8)
-                )
-                max_entropy = jnp.log(jnp.asarray(attention_mean.shape[0]))
-                attention_metrics = {
-                    "am_attention/entropy": float(attention_entropy),
-                    "am_attention/normalized_entropy": float(
-                        attention_entropy / (max_entropy + 1e-8)
-                    ),
-                    "am_attention/recency_center": float(
-                        jnp.sum(attention_mean * time_axis)
-                    ),
-                    "am_attention/latest_token_weight": float(attention_mean[-1]),
-                    "am_attention/oldest_token_weight": float(attention_mean[0]),
-                }
-        metrics_duration = time.perf_counter() - metrics_start_time
-
-        logging_start_time = time.perf_counter()
-        if self.env.use_wandb:
-            wandb_payload = {
-                "am_collection_phase": phase["name"],
-                "am_collection_failure_fraction": phase_failure_fraction,
-                "am_collection_disturbance_fraction": phase_disturbance_fraction,
-                "am_train_loss_last": am_train_loss_value,
-                "am_train_loss_mean": mean_am_train_loss,
-                "am_context_loss": am_context_loss,
-                "am_delta_loss": am_delta_loss,
-                "am_tracking_loss": am_tracking_loss,
-                "am_authority_loss": am_authority_loss,
-                "am_kl_loss": am_kl_loss,
-                "am_total_loss": am_total_loss,
-                "am_val_loss_last": (
-                    last_val_loss_value
-                    if last_val_loss_value is not None
-                    else float("nan")
-                ),
-                "am_val_loss_mean": (
-                    mean_am_val_loss if val_loss_count > 0 else float("nan")
-                ),
-                "am_val_context_loss": am_val_context_loss,
-                "am_val_delta_loss": am_val_delta_loss,
-                "am_val_tracking_loss": am_val_tracking_loss,
-                "am_val_authority_loss": am_val_authority_loss,
-                "am_val_kl_loss": am_val_kl_loss,
-                "am_val_total_loss": am_val_total_loss,
-            }
-            wandb_payload.update(attention_metrics)
-            wandb.log(wandb_payload)
-
-        if self.agent.has_logger:
-            logger_attention_metrics = {
-                key.replace("/", "_"): value for key, value in attention_metrics.items()
-            }
-            self.env.logger.log(
-                self.env.run_id,
-                float(self.env.mjx_batch.time[0]),
-                step=int(epoch),
-                run_name=self.env.run_name,
-                stage="am_training",
-                am_collection_phase=phase["name"],
-                am_collection_failure_fraction=phase_failure_fraction,
-                am_collection_disturbance_fraction=phase_disturbance_fraction,
-                am_train_loss_last=am_train_loss_value,
-                am_train_loss_mean=mean_am_train_loss,
-                am_context_loss=am_context_loss,
-                am_delta_loss=am_delta_loss,
-                am_tracking_loss=am_tracking_loss,
-                am_authority_loss=am_authority_loss,
-                am_kl_loss=am_kl_loss,
-                am_total_loss=am_total_loss,
-                am_val_loss_last=(
-                    last_val_loss_value if last_val_loss_value is not None else 0.0
-                ),
-                am_val_loss_mean=mean_am_val_loss,
-                am_val_context_loss=am_val_context_loss,
-                am_val_delta_loss=am_val_delta_loss,
-                am_val_tracking_loss=am_val_tracking_loss,
-                am_val_authority_loss=am_val_authority_loss,
-                am_val_kl_loss=am_val_kl_loss,
-                am_val_total_loss=am_val_total_loss,
-                mean_lateral_error=float(tracking_vals.mean()),
-                mean_angle_error=float(angle_vals.mean()),
-                mean_extrinsic_error=float(extrinsic_vals.mean()),
-                **logger_attention_metrics,
-            )
-        logging_duration = time.perf_counter() - logging_start_time
-
-        save_start_time = time.perf_counter()
-        should_save_checkpoint = (
-            (epoch + 1) % am_checkpoint_interval == 0
-            or epoch == self.epochs - 1
-        )
-        if should_save_checkpoint:
-            save_adaptation_module(
-                self.am, self.ckpt_dir, self.adaptation_module_file_name
-            )
-        save_duration = time.perf_counter() - save_start_time
-        total_duration = time.perf_counter() - epoch_start_time
-        print(
-            f"[AM Timing] Epoch {epoch + 1}/{self.epochs}: "
-            f"rollout {rollout_duration:.2f}s | targets {target_duration:.2f}s | "
-            f"update {update_duration:.2f}s | metrics {metrics_duration:.2f}s | "
-            f"logging {logging_duration:.2f}s | save {save_duration:.2f}s | "
-            f"total {total_duration:.2f}s"
-        )
+    # Copy policy state, not the source estimator; the destination estimator stays fresh.
+    restore_trained_modules(runner.agent, checkpoint.parent, checkpoint.name)
+    runner._rng = metadata["runner_rng"]
+    runner.env._rng = metadata["env_rng"]
+    runner.policy_epoch = int(metadata["policy_epoch"])
+    runner.adaptation_epoch = 0
+    runner.teacher_source = {
+        "path": str(checkpoint),
+        "config_id": metadata["config_id"],
+        "model_id": model_fingerprint(runner.agent.actor),
+    }
+    # A local policy checkpoint makes evaluation/resume independent of the source path.
+    runner.save("policy")

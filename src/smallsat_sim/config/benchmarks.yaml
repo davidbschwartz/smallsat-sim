@@ -1,0 +1,25 @@
+# Training variants and evaluation cases for the maintained benchmark suite.
+experiments:
+  sac_nominal: {algorithm: sac, randomized: false, adaptation: null}
+  sac_randomized: {algorithm: sac, randomized: true, adaptation: null}
+  ppo_nominal: {algorithm: ppo, randomized: false, adaptation: null}
+  ppo_randomized: {algorithm: ppo, randomized: true, adaptation: null}
+  vpg_nominal: {algorithm: vpg, randomized: false, adaptation: null}
+  vpg_randomized: {algorithm: vpg, randomized: true, adaptation: null}
+  rma_cnn: {algorithm: ppo, randomized: true, adaptation: cnn}
+  rma_transformer: {algorithm: ppo, randomized: true, adaptation: transformer}
+
+# Each case uses a seeded reset and a 5-second fault onset unless overridden.
+core:
+  - {name: nominal}
+  - {name: stuck_off, failure_types: [stuck_off]}
+  - {name: stuck_on, failure_types: [stuck_on]}
+  - {name: faulty_valve, failure_types: [faulty_valve]}
+  - {name: saturated_thrust, failure_types: [saturated_thrust]}
+  - {name: thrust_instability, failure_types: [thrust_instability]}
+  - {name: constant_wrench, disturbance: true}
+stress:
+  - {name: two_stuck_off, failure_types: [stuck_off, stuck_off]}
+  - {name: two_stuck_on, failure_types: [stuck_on, stuck_on]}
+  - {name: stuck_off_plus_wrench, failure_types: [stuck_off], disturbance: true}
+  - {name: mixed_faults, failure_types: [stuck_off, stuck_on]}

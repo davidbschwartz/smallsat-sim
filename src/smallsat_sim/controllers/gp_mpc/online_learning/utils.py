@@ -1,4 +1,5 @@
-# from zero_order_gpmpc.models.gpytorch_models import FeatureSelector
+"""Feature scaling utilities for online GP-MPC learning."""
+
 from l4acados.models.pytorch_models.pytorch_feature_selector import PyTorchFeatureSelector
 import torch
 import gpytorch
@@ -15,7 +16,7 @@ class ScaleFeatureSelector(PyTorchFeatureSelector):
         device="cpu",
     ) -> torch.Tensor:
         input_selection = input_selection * scale
-        super().__init__(input_selection, external_inputs, device)
+        super().__init__(input_selection=input_selection, external_inputs=external_inputs, device=device)
 
 
 class ResidualScaler:

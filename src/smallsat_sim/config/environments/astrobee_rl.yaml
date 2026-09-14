@@ -1,0 +1,74 @@
+# Simulation and controller settings. Matrices use !array.
+model: astrobee
+compiler:
+  convexhull: 'true'
+visual:
+  headlight:
+    ambient: 0.5 0.5 0.5
+    specular: 0.5 0.5 0.5
+    diffuse: 0.5 0.5 0.5
+Bodies:
+  num_bodies: 1
+  bodies_list:
+  - name: body0
+    pos: [0, 0.0, 10.17]
+    euler: [0, 0, 0]
+  max_start_offset: 2.0
+  max_start_linear_velocity: 0.1
+  max_start_angular_velocity: 0.1
+control:
+  PD:
+    control_decimation: 10
+    gains:
+      Kp_x: 0.2
+      Kd_x: 1.0
+      Kp_q: 3.0
+      Kd_q: 5.0
+environment:
+  faults: []
+  custom_faults: []
+  custom_disturbances: []
+  control_decimation: 5
+  num_envs: 4096
+  train_with_failures: true
+  failure_fraction: 0.5
+  disturbance_fraction: 0.1
+  failure_start_time: [0.0, 25.0]
+  disturbance_start_time: [0.0, 25.0]
+  failure_distribution:
+    stuck_off: 0.2
+    stuck_on: 0.2
+    faulty_valve: 0.2
+    saturated_thrust: 0.2
+    thrust_instability: 0.2
+  collect_reward_components: true
+  reward: vec_env/full_pose
+  termination: full_pose
+  rollout_backend: mjx
+  sigma_pos: 1.6
+  sigma_vel: 0.2
+  sigma_att: 0.8
+  sigma_angvel: 0.08
+  w_pos: 50.0
+  w_vel: 10.0
+  w_att: 30.0
+  w_angvel: 0.5
+  lam_fuel: 0.001
+  lam_speed_terminal: 1.0
+  lam_ang_speed_terminal: 0.1
+  lam_fuel_terminal: 0.005
+  terminal_bonus: 20.0
+  terminal_radius: 0.25
+  terminal_hold_steps: 5
+  terminal_max_speed: 0.15
+  terminal_max_att_error: 0.25
+  terminal_max_ang_speed: 0.05
+  enable_failure_termination: false
+  failure_max_position_error: 8.0
+  failure_max_speed: 2.0
+  failure_max_att_error: 2.8
+  failure_max_ang_speed: 2.0
+  lam_wrench_residual: 0.0
+  wrench_residual_tolerance: 0.1
+  wrench_residual_clip: 0.5
+  success_criterion: full_pose

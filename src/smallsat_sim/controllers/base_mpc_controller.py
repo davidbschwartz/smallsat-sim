@@ -1,3 +1,5 @@
+"""Shared MPC controller interface and trajectory buffers."""
+
 from smallsat_sim.envs.base_env import BaseEnv
 from smallsat_sim.planners.base_planner import BasePlanner
 from smallsat_sim.controllers.base_controller import BaseController
@@ -9,9 +11,14 @@ import numpy as np
 
 class BaseMPCController(BaseController):
     def __init__(self, env: BaseEnv, planner: BasePlanner, ctrl_cfg: object) -> None:
-        # Flag to indicate whether the controller is MPC-based (for visualization purposes)
-        planner.is_mpc = True
 
+        if not np.isclose(ctrl_cfg.Ts, env.env_cfg.sim.dt * ctrl_cfg.control_decimation):
+            raise ValueError("MPC Ts must equal sim.dt * control_decimation")
+        for name in ("Q", "R", "T", "Q_c", "Q_q", "Q_omega"):
+            if hasattr(ctrl_cfg.cost, name):
+                setattr(ctrl_cfg.cost, name, np.asarray(getattr(ctrl_cfg.cost, name), dtype=float))
+        if ctrl_cfg.cost.R.shape != (env.symbolic_model.nu, env.symbolic_model.nu):
+            raise ValueError("MPC R must match the spacecraft actuator count")
         super().__init__(env, planner, ctrl_cfg)
 
         # Save symbolic model here too
@@ -42,7 +49,6 @@ class BaseMPCController(BaseController):
         """
         pass
 
-    @abstractmethod
     def _visualize_prediction_renderer(self) -> None:
         """
         Plot predicted trajectory of MPC in MuJoCo renderer.

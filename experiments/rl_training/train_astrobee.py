@@ -1,43 +1,39 @@
-import os
+"""Train and evaluate the default Astrobee RL workflow."""
 
-# Set flags to improve XLA performance on GPU
-os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True "
+import wandb
 
-import time
-
-from smallsat_sim.utils.helpers import get_args
-from smallsat_sim.controllers.rl.runners.on_policy_runner import OnPolicyRunner
-from smallsat_sim.envs.astrobee_rl.env import AstrobeeEnvVectorized
+from smallsat_sim.controllers.rl.runners.factory import make_runner
+from smallsat_sim.envs.vehicles.astrobee_rl.env import AstrobeeEnvVectorized
+from smallsat_sim.envs.vehicles.astrobee_rl.config import resolve_config
 from smallsat_sim.planners.oracle.oracle_rl import OraclePlannerRL
+from smallsat_sim.utils.helpers import get_args
 
 
-# Get arguments for script execution
-args = get_args()
+def main():
+    args = get_args()
+    config = resolve_config()
+    env = AstrobeeEnvVectorized(args=args, config=config.env)
+    try:
+        planner = OraclePlannerRL(env, radius=0.0)
+        runner = make_runner(env, planner, config=config.training)
 
-# Create environment
-env = AstrobeeEnvVectorized(args=args)
+        # Edit the stages here. To resume RL, omit pretraining and pass
+        # mode="resume" to learn (and to adaptation if that stage has started).
+        if config.training.algorithm != "sac":
+            runner.pretrain()
+        runner.learn()
+        if env.use_adaptive_approach:
+            runner.train_adaptation_module_on_policy()
+        runner.evaluate()
 
-# Create planner
-planner = OraclePlannerRL(env, radius=0.0)
+        # The runner handles requested rollout videos and live visualization.
+        if args.log:
+            env.logger.save_log()
+    finally:
+        env.close()
+        if args.wandb:
+            wandb.finish()
 
-# Create runner
-runner = OnPolicyRunner(env, planner)
 
-# Pretraining
-runner.pretrain()
-
-# Learning
-runner.learn()
-
-# Adaptation module training
-runner.train_adaptation_module_on_policy()
-
-# Evaluation
-runner.evaluate()
-
-# Create simulation video if desired
-env.get_sim_rendering(env.env_name)
-
-# Save log if logging is enabled
-if args.log:
-    env.logger.save_log()
+if __name__ == "__main__":
+    main()

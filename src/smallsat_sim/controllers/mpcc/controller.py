@@ -1,3 +1,5 @@
+"""Model predictive contouring controller for path tracking."""
+
 from smallsat_sim.controllers.base_mpc_controller import BaseMPCController
 from smallsat_sim.envs.base_env import BaseEnv
 from smallsat_sim.planners.base_planner import BasePlanner
@@ -9,8 +11,9 @@ from typing import TypeVar
 import numpy as np
 import jax.numpy as jnp
 import os
+import tempfile
+from smallsat_sim.controllers.state import body_state
 import casadi as ca
-import mujoco
 import time
 
 from casadi import SX
@@ -31,6 +34,8 @@ class NominalMPCCController(BaseMPCController):
 
     def __init__(self, env: BaseEnv, planner: BasePlanner) -> None:
         # Fetch correct controller config
+        from smallsat_sim.planners.validation import require_contouring_planner
+        require_contouring_planner(planner)
         self.ctrl_cfg = env.env_cfg.control.NominalMPCC
 
         # Initialize base class
@@ -42,28 +47,8 @@ class NominalMPCCController(BaseMPCController):
         # Initialize solver
         self._initialize_solver(env)
 
-        # Check if there is a viewer. In case there is not,
-        # dynamically allocate the visualize method to a lambda
-        # function doing nothing.
-        if env.viewer:
-            self.viewer = env.viewer
-
-            # Setup util parameters for visualization
-            self.viz_offset = self.viewer.user_scn.ngeom
-            self.viewer.user_scn.ngeom += self.ctrl_cfg.N + 1
-        else:
-            self._visualize_prediction = lambda *args, **kwargs: None
-
-        # Check if there is a renderer. In case there is not,
-        # dynamically allocate the visualize_renderer method
-        # to a lambda function doing nothing.
-        if env.renderer:
-            self.renderer = env.renderer
-            self.frames = env.frames
-            self.data = env.data
-            self.env_cfg = env.env_cfg
-        else:
-            self._visualize_prediction_renderer = lambda *args, **kwargs: None
+        self.visualization = getattr(env, "visualization", None)
+        self._record_video = bool(getattr(getattr(env, "args", None), "video", False))
 
     def _generate_solver(self, env: BaseEnv) -> None:
         """
@@ -92,11 +77,12 @@ class NominalMPCCController(BaseMPCController):
 
         acados_model.x = ca.vertcat(acados_model.x, theta)
         acados_model.u = ca.vertcat(acados_model.u, d_theta)
-        acados_model.xdot = ca.vertcat(acados_model.xdot, d_theta)
+        theta_dot = ca.SX.sym("theta_dot")
+        acados_model.xdot = ca.vertcat(acados_model.xdot, theta_dot)
 
         acados_model.f_expl_expr = ca.vertcat(acados_model.f_expl_expr, d_theta)
 
-        acados_model.f_impl_expr = ca.vertcat(acados_model.f_impl_expr, 0)
+        acados_model.f_impl_expr = ca.vertcat(acados_model.f_impl_expr, theta_dot - d_theta)
 
         # Assign parameters and model
         Ts = self.ctrl_cfg.Ts
@@ -124,7 +110,6 @@ class NominalMPCCController(BaseMPCController):
         # Extract states for ease of use
         r = model.x[0:3]
         q = model.x[3:7]
-        v = model.x[7:10]
         omega = model.x[10:13]
 
         # Calculate errors
@@ -146,38 +131,15 @@ class NominalMPCCController(BaseMPCController):
         # Contouring error
         e_c = P_n @ e
 
-        # Quaternion error
-        q_conj = np.array([q[0], -q[1], -q[2], -q[3]])
-        e_q = np.array(
-            [
-                q_des[0] * q_conj[0]
-                - q_des[1] * q_conj[1]
-                - q_des[2] * q_conj[2]
-                - q_des[3] * q_conj[3],
-                q_des[0] * q_conj[1]
-                + q_des[1] * q_conj[0]
-                + q_des[2] * q_conj[3]
-                - q_des[3] * q_conj[2],
-                q_des[0] * q_conj[2]
-                - q_des[1] * q_conj[3]
-                + q_des[2] * q_conj[0]
-                + q_des[3] * q_conj[1],
-                q_des[0] * q_conj[3]
-                + q_des[1] * q_conj[2]
-                - q_des[2] * q_conj[1]
-                + q_des[3] * q_conj[0],
-            ]
-        )
-
-        # We only want to minimize eps part of error quaternion
-        e_q_vec = e_q - ca.DM([1, 0, 0, 0])
+        from smallsat_sim.controllers.nominal_mpc.reference import attitude_cost
+        rotation_cost = attitude_cost(q, q_des, Q_q)
 
         # Setup cost
         ocp.cost.cost_type = "EXTERNAL"
         ocp.model.cost_expr_ext_cost = (
             q_l * e_l * e_l
             + e_c.T @ Q_c @ e_c
-            + e_q_vec.T @ (Q_q) @ e_q_vec
+            + rotation_cost
             + omega.T @ Q_omega @ omega
             + (model.u.T) @ R @ (model.u)
             - q_theta * d_theta
@@ -276,10 +238,6 @@ class NominalMPCCController(BaseMPCController):
         # Slacks on lower/upper bounds
         ocp.constraints.lsbx = np.zeros(ocp.dims.nsbx)
         ocp.constraints.usbx = np.zeros(ocp.dims.nsbx)
-        ocp.constraints.usbx[7:10] = 0.05
-        ocp.constraints.usbx[7:10] = -0.05
-        ocp.constraints.usbx[10:13] = 0.02
-        ocp.constraints.usbx[10:13] = -0.02
         ocp.constraints.idxsbx = np.arange(nx)
 
         ocp.cost.Zl = 5e02 * np.ones(ocp.dims.ns)
@@ -290,14 +248,14 @@ class NominalMPCCController(BaseMPCController):
         # Define input constraints
         # Fetch thurster limits from the model configuration
         thruster_forces = [
-            thruster.forcerange for thruster in env.model_cfg.Thrusters.thruster_list
+            thruster.forcerange for thruster in env.model_cfg.actuators
         ]
         ocp.constraints.lbu = np.array([forces[0] for forces in thruster_forces])
         ocp.constraints.ubu = np.array([forces[1] for forces in thruster_forces])
 
         # Attach dtheta constraints
         ocp.constraints.lbu = np.append(ocp.constraints.lbu, 0.0)
-        ocp.constraints.ubu = np.append(ocp.constraints.ubu, 0.2)
+        ocp.constraints.ubu = np.append(ocp.constraints.ubu, getattr(self.ctrl_cfg, "progress_rate_limit", 0.2))
         ocp.constraints.idxbu = np.arange(nu)
 
         # Set intial condition
@@ -311,14 +269,13 @@ class NominalMPCCController(BaseMPCController):
         ocp.solver_options.tf = Ts * self.ctrl_cfg.N
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
-        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+        ocp.solver_options.hessian_approx = "EXACT"
+        ocp.solver_options.regularize_method = "PROJECT"
         ocp.solver_options.integrator_type = "ERK"
         ocp.solver_options.print_level = 0
 
         # Set code generation directory
-        save_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "c_generated_code"
-        )
+        save_dir = getattr(self.ctrl_cfg, "code_export_directory", None) or tempfile.mkdtemp(prefix="smallsat_mpcc_")
         ocp.code_export_directory = save_dir
 
         # Create solver with agent specific code files
@@ -334,7 +291,7 @@ class NominalMPCCController(BaseMPCController):
         """
 
         # Retrieve closest point on track (relevant for theta)
-        _, theta_init = self.planner.closest_point_on_trajectory(env.get_obs()[0:3])
+        _, theta_init = self.planner.closest_point_on_trajectory(body_state(env)[0:3])
 
         # Array to store previous theta
         self.theta_prev = [theta_init for i in range(self.ctrl_cfg.N + 1)]
@@ -345,7 +302,7 @@ class NominalMPCCController(BaseMPCController):
         Ts = self.ctrl_cfg.Ts
         distance_on_track = theta_init
         x_guess = np.zeros((14, 1))
-        u_guess = np.random.uniform(low=0.0, high=0.3, size=(13, 1))
+        u_guess = np.zeros((env.symbolic_model.nu + 1, 1))
 
         for i in range(self.ctrl_cfg.N + 1):
             curr_vel = (0.05 - v_init) * i / self.ctrl_cfg.N + v_init
@@ -355,10 +312,12 @@ class NominalMPCCController(BaseMPCController):
                 distance_on_track
             )
 
-            x_guess[0:13, 0] = env.get_obs()
+            x_guess[0:13, 0] = body_state(env)
             x_guess[0:3, 0] = point.position
             x_guess[3:7, 0] = point.attitude
-            x_guess[7, 0] = -curr_vel
+            from smallsat_sim.utils.helpers import Rquat
+            tangent = self.planner.trajectory._get_tangent_segment(distance_on_track)
+            x_guess[7:10, 0] = np.asarray(Rquat(point.attitude)).T @ (curr_vel * tangent)
             x_guess[-1] = distance_on_track
 
             u_guess[-1] = (0.05 - v_init) / self.ctrl_cfg.N
@@ -375,23 +334,22 @@ class NominalMPCCController(BaseMPCController):
         start_time = time.time()
         # Check solver status and re-initialize if needed
         if self.ocp_solver.status != 0:
-            print(f"Solution optimal, solver status: {self.ocp_solver.status}")
+            print(f"Reinitializing MPCC after solver status: {self.ocp_solver.status}")
             self._initialize_solver(env)
 
         # Set parameters
-        self._set_params(env.get_obs())
+        self._set_params(body_state(env))
 
         # Solve for the first control input in receding horizon fashion
-        xinit = np.append(env.get_obs(), self.theta_prev[1])
+        xinit = np.append(body_state(env), self.theta_prev[1])
         u0 = self.ocp_solver.solve_for_x0(
             xinit, print_stats_on_failure=True, fail_on_nonzero_status=False
         )
+        from smallsat_sim.controllers.nominal_mpc.reference import require_valid_control
+        require_valid_control(self.ocp_solver.status, u0)
         self._visualize_prediction()
 
         self.planner.get_reference(env.obs)  # always update reference for bookeeping
-
-        if hasattr(self, "renderer") and self.renderer is not None:
-            self._visualize_prediction_renderer()
 
         if False:
             solve_time = self.ocp_solver.get_stats("time_tot")
@@ -413,7 +371,7 @@ class NominalMPCCController(BaseMPCController):
         # Calculate the duration
         self.ctrl_input_callback_time = end_time - start_time
 
-        return u0[0:12].copy()
+        return u0[:-1].copy()
 
     def _set_params(self, obs: T) -> None:
         """
@@ -446,7 +404,7 @@ class NominalMPCCController(BaseMPCController):
         """
         if self.has_logger:
             obs_gt = (
-                env.get_obs()
+                body_state(env)
             )  # TODO: Change this to get GT obs, once MR has been merged
 
             # Tracking error
@@ -493,41 +451,7 @@ class NominalMPCCController(BaseMPCController):
             )
 
     def _visualize_prediction(self) -> None:
-        """
-        Plot predicted trajectory of MPC in MuJoCo viewer.
-        """
-        for i in range(self.ctrl_cfg.N + 1):
-            point = self.ocp_solver.get(i, "x")[0:3]
-            mujoco.mjv_initGeom(
-                self.viewer.user_scn.geoms[i + self.viz_offset],
-                type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                size=[0.01, 0, 0],
-                pos=point,
-                mat=np.eye(3).flatten(),
-                rgba=np.array([0, 0, 1, 2]),
-            )
-
-    def _visualize_prediction_renderer(self) -> None:
-        """
-        Plot predicted trajectory of MPC in MuJoCo renderer.
-        """
-        if (
-            self.data.time >= self.env_cfg.renderer.start_recording
-            and self.data.time <= self.env_cfg.renderer.end_recording
-        ):
-            for i in range(self.ctrl_cfg.N + 1):
-                point = self.ocp_solver.get(i, "x")[0:3]
-                mujoco.mjv_initGeom(
-                    self.renderer.scene.geoms[i + self.renderer.scene.ngeom],
-                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=[0.01, 0, 0],
-                    pos=point,
-                    mat=np.eye(3).flatten(),
-                    rgba=np.array([0, 0, 1, 2]),
-                )
-
-            self.renderer.scene.ngeom += self.ctrl_cfg.N + 1
-
-            # Extract image from renderer and append it for post-processing
-            sim_img = self.renderer.render().copy()
-            self.frames.append(sim_img)
+        """Submit the predicted trajectory; rendering happens after the simulation step."""
+        if self.visualization is not None:
+            points = [self.ocp_solver.get(i, "x")[0:3] for i in range(self.ctrl_cfg.N + 1)]
+            self.visualization.set_overlay("prediction", points, color=(0, 0, 1, 1), radius=.01)

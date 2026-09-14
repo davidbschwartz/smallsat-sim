@@ -1,0 +1,15 @@
+# Construct a nominal SAC training experiment without randomized faults.
+vehicle: astrobee_rl
+controller: rl
+planner: oracle_rl
+planner_radius: 0.0
+algorithm: sac
+run_name: sac_nominal
+log: false
+headless: true
+overrides:
+  RL:
+    use_adaptive_approach: false
+    train_with_failures: false
+    rollout_backend: freeflyer
+    num_envs: 16

@@ -1,36 +1,32 @@
-# This file includes various helper functions
-# Can be included at the beginning of a file the following way:
-# from utils.helpers import "function name"
+"""Shared experiment arguments and numerical utilities."""
 
-# Parsing
 import argparse
-import numpy as np
-import jax.numpy as jnp
-import scipy.signal
-
-import torch
-import psutil
 import os
-
 from typing import Callable, TypeVar
-from scipy.spatial.transform import Rotation as R
 
-# Import all base classes for typing
+import jax.numpy as jnp
+import numpy as np
+import psutil
+import scipy.signal
+from scipy.spatial.transform import Rotation as R
+import torch
+
 from smallsat_sim.controllers.base_controller import BaseController
 from smallsat_sim.controllers.base_mpc_controller import BaseMPCController
 from smallsat_sim.envs.base_env import BaseEnv
+from smallsat_sim.envs.rendering.rollout import add_visualization_args
 from smallsat_sim.planners.base_planner import BasePlanner
-
 
 T = TypeVar("T", np.ndarray, jnp.ndarray)
 
 
-def get_args() -> argparse.Namespace:
+def get_args(parser: argparse.ArgumentParser | None = None) -> argparse.Namespace:
     """
-    This parser includes all non-environment and non-controller specific settings
+    Parse shared experiment settings. Supply a parser to add script-specific options.
     """
     # Create the parser
-    parser = argparse.ArgumentParser(description="Parse command line inputs")
+    if parser is None:
+        parser = argparse.ArgumentParser(description="Parse command line inputs")
 
     # Add arguments
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
@@ -65,6 +61,8 @@ def get_args() -> argparse.Namespace:
             "Positive values move target inward toward station surface."
         ),
     )
+
+    add_visualization_args(parser)
 
     # Parse the arguments
     args = parser.parse_args()
@@ -176,7 +174,7 @@ def quat_multiply(q1: T, q2: T) -> T:
 
     else:
         raise ValueError("input must be of dim. 4 (unit quaternion)")
-    
+
     return q
 
 

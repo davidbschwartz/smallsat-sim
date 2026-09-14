@@ -14,121 +14,48 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from smallsat_sim.controllers.base_controller import BaseController
-from smallsat_sim.planners.base_planner import BasePlanner
-from smallsat_sim.envs.base_env import BaseEnv
-from smallsat_sim.utils.helpers import quat_multiply, quat_conjugate, Rquat, sgn_quat
-
 import numpy as np
+
+from smallsat_sim.controllers.base_controller import BaseController
+from smallsat_sim.controllers.state import actuator_bounds
+from smallsat_sim.controllers.pd.common import (
+    calc_B_matrix, compute_control, constrain_thrust, thruster_groups,
+)
 
 
 class PDController(BaseController):
-    def __init__(self, env: BaseEnv, planner: BasePlanner) -> None:
-        # Fetch correct controller config
+    """Single-environment NumPy adapter for the shared PD calculation."""
+
+    def __init__(self, env, planner):
         ctrl_cfg = env.env_cfg.control.PD
-
-        # Initialize base class
         super().__init__(env, planner, ctrl_cfg)
-
-        # Set some reference quantities (Deprecated?)
         self.v_ref = np.zeros((3, 1))
-        self.omega_ref = np.zeros((3, 1))  # Angular velocity
-
-        # Extract PD gains
+        self.omega_ref = np.zeros((3, 1))
         self.Kp_x = ctrl_cfg.gains.Kp_x
         self.Kd_x = ctrl_cfg.gains.Kd_x
         self.Kp_q = ctrl_cfg.gains.Kp_q
         self.Kd_q = ctrl_cfg.gains.Kd_q
-
         self.B_matrix = self.calc_B_matrix(env.model)
+        self._inverse_mixer = np.linalg.pinv(self.B_matrix)
+        self._groups = thruster_groups(env.model)
+        self._bounds = actuator_bounds(env.model)
 
-    def calc_B_matrix(self, model) -> np.ndarray:
-        """Create B matrix (thruster configuration matrix, mixer, etc.)"""
-        B_matrix = np.empty(shape=(6, model.nu))
-        for i in range(model.nu):
-            actuator = model.actuator(i)
-            force = model.actuator(i).gear[0:3]  # Force produced by thruster 'i'
-            # Resolve the actuator transmission target robustly. Using `site(i)` assumes
-            # the first `nu` sites are thruster sites, which is false in the Gateway
-            # scene (dock marker sites are defined earlier in the XML).
-            site_id = int(actuator.trnid[0])
-            if site_id >= 0:
-                actuator_pos = model.site(site_id).pos
-            else:
-                # Fallback for unusual actuator types without a site transmission.
-                actuator_pos = model.site(i).pos
-            # Add direct forces and torques to B matrix. Then calculate force arms and add
-            B_matrix[:, i] = actuator.gear + np.append(
-                [0, 0, 0], np.cross(actuator_pos, force)
-            )
-        return B_matrix
+    calc_B_matrix = staticmethod(calc_B_matrix)
 
-    def _apply_ctrl_constraint(self, env: BaseEnv, u: np.ndarray) -> np.ndarray:
-        """Apply non-negative control constraints to the input control signal u."""
-        # Get index of all thrusters that give propulsion in x,y,z
-        # This assumes that thrusters only have propulsion in one direction!
-        x_thrusters_id = [
-            i for i, gear in enumerate(env.model.actuator_gear) if gear[0] != 0
-        ]
-        y_thrusters_id = [
-            i for i, gear in enumerate(env.model.actuator_gear) if gear[1] != 0
-        ]
-        z_thrusters_id = [
-            i for i, gear in enumerate(env.model.actuator_gear) if gear[2] != 0
-        ]
+    def _apply_ctrl_constraint(self, env, u):
+        return constrain_thrust(u, self._groups, np)
 
-        for list in [x_thrusters_id, y_thrusters_id, z_thrusters_id]:
-            min_thrust = np.amin(u[list])  # Find lowest thrust value in the list
-            if min_thrust < 0:
-                u[list] -= min_thrust  # Subtract the minimum thrust from all thrusters
-        return u
+    def get_control_input(self, env):
+        obs = env.get_obs()
+        position, quaternion = self.planner.get_reference(obs)
+        reference = np.concatenate((np.asarray(position).ravel(), np.asarray(quaternion).ravel()))
+        return compute_control(
+            obs[None, :], reference[None, :], self.v_ref,
+            (self.Kp_x, self.Kd_x, self.Kp_q, self.Kd_q),
+            self._inverse_mixer, self._groups,
+            velocity_frame=env.env_cfg.sim.obs.v_frame, xp=np,
+            mixer=self.B_matrix, bounds=self._bounds,
+        )[0]
 
-    def get_control_input(self, env: BaseEnv) -> np.ndarray:
-        """
-        Defines the controller callback for the simulation step.
-        """
-
-        desired_pos, desired_quat = self.planner.get_reference(env.obs)
-        desired_linvel = self.v_ref  # Linear
-        desired_angvel = np.zeros((3, 1))
-        current_pos = np.reshape(env.obs[:3], (3, 1))
-        current_quat = np.reshape(env.obs[3:7], (4, 1))
-        current_linvel = np.reshape(env.obs[7:10], (3, 1))  # Linear
-        current_angvel = np.reshape(env.obs[10:13], (3, 1))  # Angular
-
-        x_error = desired_pos - current_pos  # Linear, world frame
-        v_error = desired_linvel - current_linvel  # Linear, world frame
-        # Desired quaternion - current quaternion:
-        quat_error = quat_multiply(desired_quat, quat_conjugate(current_quat))
-        eta_error = quat_error[0]
-        eps_error = quat_error[1:]
-
-        # PD, linear part. Note: both position and velocity are decomposed
-        # in the world frame. R.T rotates them to the body frame
-        R_WB = Rquat(current_quat)  # Rotation matrix from body to world
-        desired_linacc = (
-            self.Kp_x * R_WB.T @ x_error  # Desired linear acceleration
-            + self.Kd_x * R_WB.T @ v_error
-        )
-        # PD, angular part, (alpha=angular acceleration).
-        # Note: angular velocity is decomposed in the body frame
-        desired_alpha = self.Kp_q * sgn_quat(
-            float(eta_error)
-        ) * eps_error + self.Kd_q * (desired_angvel - current_angvel)
-        desired_acceleration = np.append(desired_linacc, desired_alpha)
-
-        desired_control = desired_acceleration
-        # Distribute the desired forces and torques to the actuators, least squares
-        u_unconstrained = np.dot(np.linalg.pinv(self.B_matrix), desired_control)
-
-        # Only allow non-negative thrust values
-        u = self._apply_ctrl_constraint(env, u_unconstrained)
-        return u
-
-    def _log(self, run_id: int, timestamp: float, env: BaseEnv) -> None:
-        """
-        Logs desired quantities if flag is enabled
-        """
-        raise NotImplementedError(
-            f"The _log method is not implemented for the class {self.__class__.__name__}"
-        )
+    def _log(self, run_id, timestamp, env):
+        raise NotImplementedError(f"Logging is not implemented for {type(self).__name__}")

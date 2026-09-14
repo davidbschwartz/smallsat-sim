@@ -1,53 +1,34 @@
-import jax
-import jax.numpy as jnp
+"""Small seeded MLPs shared by policy and value models."""
+
+import math
+
 from flax import nnx
-
-
-def identity(input: jnp.ndarray) -> jnp.ndarray:
-    """
-    Identity layer (placeholder).
-    """
-    return input
 
 
 def mlp(
     sizes,
-    activation,
+    activation=nnx.tanh,
     output_activation=None,
-    std=jnp.sqrt(2).item(),
-    last_layer_std=jnp.sqrt(2).item(),
+    std=math.sqrt(2),
+    last_layer_std=1.0,
+    *,
+    rngs,
 ):
-    """
-    Basic multilayer perceptron architecture.
-    """
-    modules = []
-    current_std = std
-
-    for i in range(len(sizes) - 1):
-        if i >= len(sizes) - 2:
-            if output_activation is None:
-                activation_function = identity
-            else:
-                activation_function = output_activation
-            current_std = last_layer_std
-        else:
-            activation_function = activation
-        modules += [
+    layers = []
+    for i, (inputs, outputs) in enumerate(zip(sizes[:-1], sizes[1:])):
+        last = i == len(sizes) - 2
+        layers.append(
             nnx.Linear(
-                sizes[i],
-                sizes[i + 1],
-                # Avoid QR/SVD-based initializers here: on some GPU/CUDA stacks
-                # cuSolver handle creation fails during startup. Variance scaling
-                # keeps the intended gain without invoking cuSolver.
-                kernel_init=jax.nn.initializers.variance_scaling(
-                    scale=float(current_std) ** 2,
-                    mode="fan_avg",
-                    distribution="uniform",
+                inputs,
+                outputs,
+                rngs=rngs,
+                kernel_init=nnx.initializers.orthogonal(
+                    last_layer_std if last else std
                 ),
-                bias_init=nnx.initializers.constant(0.0),
-                rngs=nnx.Rngs(params=0),
-            ),
-            activation_function,
-        ]
-
-    return nnx.Sequential(*modules)
+                bias_init=nnx.initializers.zeros_init(),
+            )
+        )
+        fn = output_activation if last else activation
+        if fn is not None:
+            layers.append(fn)
+    return nnx.Sequential(*layers)

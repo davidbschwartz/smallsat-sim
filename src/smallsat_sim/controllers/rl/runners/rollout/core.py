@@ -1,188 +1,105 @@
-import inspect
-from typing import Any, Callable, Optional
+"""Compiled rollout scan over vectorized environment transitions."""
+
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
 from .types import (
+    RolloutCarry,
+    ResetFn,
     FunctionalRolloutCallbacks,
     FunctionalRolloutResult,
     _FunctionalRolloutStep,
+    StateFeaturesFn,
+    StepFn,
 )
 
 
 def run_functional_rollout(
     *,
     step_config: Any,
+    max_episode_len: int,
     initial_state: Any,
-    initial_residuals: jnp.ndarray,
+    initial_context: jnp.ndarray,
     rng: jnp.ndarray,
     num_steps: int,
     reference_waypoint: jnp.ndarray,
     callbacks: FunctionalRolloutCallbacks,
-    extra: Any = None,
-    state_features_fn: Optional[Callable[[Any, jnp.ndarray], jnp.ndarray]] = None,
-    step_fn: Optional[
-        Callable[[Any, jnp.ndarray, jnp.ndarray, Any, jnp.ndarray], tuple[Any, Any]]
-    ] = None,
-    reset_fn: Optional[Callable[[Any, Any], Any]] = None,
+    policy_state: Any = None,
+    state_features_fn: StateFeaturesFn,
+    step_fn: StepFn,
+    reset_fn: ResetFn,
+    visualization: Any = None,
 ) -> FunctionalRolloutResult:
-    """
-    Advance the vectorised environment purely functionally for ``num_steps``.
+    """Collect a fixed horizon with independent episode boundaries per environment.
 
-    Invariants:
-    - The helper mirrors the imperative `VecEnv.transition` semantics, including
-      the `control_decimation` inner loop and per-epoch resets when all
-      environments terminate or the configured horizon is reached.
-    - `initial_residuals` must have shape `(num_envs, res_dim)` (or `(num_envs, 0)`
-      when residuals are disabled).
-    - Callback implementations must be side-effect free; any mutable state should
-      be threaded via the `extra` carry.
-    - The returned `step_outputs` contain the per-step state snapshots needed to
-      reconstruct rewards, metrics, and logging payloads without reaching back
-      into the imperative environment.
+    Policy callbacks own context/history; this scan owns action intervals, episode boundaries,
+    timeout bootstrap and reset ordering. Arrays are [environment, features]
+    inside the scan and [time, environment, features] in the result.
     """
 
-    if state_features_fn is None or step_fn is None or reset_fn is None:
-        from smallsat_sim.envs import vec_env as vec_env_mod
+    # Every backend accepts the full state and supports independently masked resets.
+    def _state_features(state):
+        return state_features_fn(state, reference_waypoint)
 
-        if state_features_fn is None:
-            state_features_fn = vec_env_mod._compute_state_features
-        if step_fn is None:
-            step_fn = vec_env_mod.vecenv_step
-        if reset_fn is None:
-            reset_fn = vec_env_mod.vecenv_reset_to_config
-
-    assert state_features_fn is not None
-    assert step_fn is not None
-    assert reset_fn is not None
-
-    def _state_batch_size(env_state: Any) -> int:
-        if hasattr(env_state, "mjx_batch"):
-            return env_state.mjx_batch.qpos.shape[0]
-        if hasattr(env_state, "qpos"):
-            return env_state.qpos.shape[0]
-        raise AttributeError("Rollout state must expose either mjx_batch.qpos or qpos")
-
-    def _state_features(env_state: Any) -> jnp.ndarray:
-        feature_source = env_state.mjx_batch if hasattr(env_state, "mjx_batch") else env_state
-        return state_features_fn(feature_source, reference_waypoint)
-
-    num_envs = _state_batch_size(initial_state)
-    reset_fn_accepts_mask = len(inspect.signature(reset_fn).parameters) >= 3
-    step_fn_accepts_prev_states = (
-        "prev_states" in inspect.signature(step_fn).parameters
-    )
-    step_fn_can_return_next_states = (
-        "return_next_states" in inspect.signature(step_fn).parameters
-    )
-
-    def _initial_episode_state():
-        initial_states = _state_features(initial_state)
-        return (
-            initial_state,
-            initial_states,
-            initial_residuals,
-            rng,
-            extra,
-            jnp.zeros((num_envs,), dtype=jnp.float32),
-            jnp.zeros((num_envs,), dtype=jnp.int32),
-        )
-
-    def _prepare_policy_input(
-        step_idx: int, states: jnp.ndarray, residuals: jnp.ndarray, carry_extra: Any
-    ):
-        return callbacks.prepare_policy_input(step_idx, states, residuals, carry_extra)
-
-    def _sample_policy(
-        step_idx: int,
-        policy_input: jnp.ndarray,
-        rng_key: jnp.ndarray,
-        carry_extra: Any,
-    ):
-        return callbacks.sample_policy(step_idx, policy_input, rng_key, carry_extra)
-
-    def _post_step(
-        step_idx: int,
-        step_output: Any,
-        actions: jnp.ndarray,
-        residuals: jnp.ndarray,
-        reset_pending: jnp.ndarray,
-        carry_extra: Any,
-    ):
-        return callbacks.post_step(
-            step_idx, step_output, actions, residuals, reset_pending, carry_extra
-        )
-
-    def _bootstrap_value(
-        step_idx: int,
-        env_state: Any,
-        residuals: jnp.ndarray,
-        rng_key: jnp.ndarray,
-        carry_extra: Any,
-    ):
-        return callbacks.bootstrap_value(
-            step_idx, env_state, residuals, rng_key, carry_extra
-        )
+    num_envs = initial_context.shape[0]
 
     def _scan_body(carry, step_idx: int):
-        env_state, states_curr, residuals, rng_key, carry_extra, ep_ret, ep_len = carry
+        env_state = carry.env_state
+        current_features = carry.features
+        context = carry.context
+        rng_key = carry.key
+        policy_state = carry.policy_state
+        episode_return_so_far = carry.episode_return
+        episode_length = carry.episode_length
 
-        policy_input, carry_extra = _prepare_policy_input(
-            step_idx, states_curr, residuals, carry_extra
+        # Observe and choose an action using the context available before this step.
+        policy_input, policy_state = callbacks.prepare_policy_input(
+            step_idx, current_features, context, policy_state
         )
-        actions, values, logp, rng_key, carry_extra = _sample_policy(
-            step_idx, policy_input, rng_key, carry_extra
+        actions, values, logp, rng_key, policy_state = callbacks.sample_policy(
+            step_idx, policy_input, rng_key, policy_state
         )
 
-        if step_fn_accepts_prev_states:
-            step_result = step_fn(
-                env_state,
-                actions,
-                reference_waypoint,
-                step_config,
-                residuals,
-                prev_states=states_curr,
-                return_next_states=step_fn_can_return_next_states,
-            )
-        else:
-            step_result = step_fn(
-                env_state,
-                actions,
-                reference_waypoint,
-                step_config,
-                residuals,
-            )
-        if step_fn_can_return_next_states:
-            next_env_state, step_output, states_next = step_result
-        else:
-            next_env_state, step_output = step_result
-            states_next = _state_features(next_env_state)
+        next_env_state, step_output, next_features = step_fn(
+            env_state, actions, reference_waypoint, step_config, context, current_features
+        )
 
-        ep_ret_next = ep_ret + step_output.rewards
-        ep_len_next = ep_len + 1
+        # Track episode boundaries independently for each environment.
+        accumulated_return = episode_return_so_far + step_output.rewards
+        accumulated_length = episode_length + 1
 
         terminated_mask = step_output.terminals.astype(bool)
-        timeout_mask = ep_len_next >= step_config.max_episode_len
+        timeout_mask = accumulated_length >= max_episode_len
         truncated_mask = jnp.logical_and(timeout_mask, jnp.logical_not(terminated_mask))
         done_mask = jnp.logical_or(terminated_mask, truncated_mask)
-        epoch_last = jnp.equal(step_idx, num_steps - 1)
-        done_flag = jnp.any(done_mask)
-        reset_mask = jnp.logical_and(done_mask, jnp.logical_not(epoch_last))
+        if visualization is not None:
+            visualization.observe(step_idx, next_env_state, done_mask)
 
-        next_residuals, step_aux, carry_extra = _post_step(
-            step_idx, step_output, actions, residuals, reset_mask, carry_extra
+        last_step = jnp.equal(step_idx, num_steps - 1)
+        done_flag = jnp.any(done_mask)
+        reset_mask = jnp.logical_and(done_mask, jnp.logical_not(last_step))
+
+        # A completed transition supplies the next context and adaptation label.
+        next_context, transition_labels, policy_state = callbacks.update_context(
+            step_idx, step_output, actions, context, reset_mask, policy_state
         )
 
+        # Timeouts and rollout boundaries bootstrap from the state BEFORE reset.
         bootstrap_mask = jnp.logical_or(
             truncated_mask,
-            jnp.logical_and(epoch_last, jnp.logical_not(terminated_mask)),
+            jnp.logical_and(last_step, jnp.logical_not(terminated_mask)),
         )
-        bootstrap_values_raw, rng_key, carry_extra = jax.lax.cond(
+        def _skip_bootstrap(operand):
+            _, _, key, current_policy_state = operand
+            return jnp.zeros_like(step_output.rewards), key, current_policy_state
+
+        bootstrap_values_raw, rng_key, policy_state = jax.lax.cond(
             jnp.any(bootstrap_mask),
-            lambda args: _bootstrap_value(step_idx, *args),
-            lambda args: (jnp.zeros_like(step_output.rewards), args[2], args[3]),
-            operand=(next_env_state, next_residuals, rng_key, carry_extra),
+            lambda args: callbacks.bootstrap_value(step_idx, *args),
+            _skip_bootstrap,
+            operand=(next_env_state, next_context, rng_key, policy_state),
         )
         bootstrap_values = jnp.where(
             bootstrap_mask,
@@ -192,48 +109,46 @@ def run_functional_rollout(
 
         episode_return = jnp.where(
             done_mask,
-            ep_ret_next,
-            jnp.zeros_like(ep_ret_next),
+            accumulated_return,
+            jnp.zeros_like(accumulated_return),
         )
 
+        # Only finished environments reset; the last step leaves state intact.
         def _reset_after_done(mask):
-            if reset_fn_accepts_mask:
-                reset_state = reset_fn(next_env_state, step_config, mask)
-            else:
-                reset_state = reset_fn(next_env_state, step_config)
+            reset_state = reset_fn(next_env_state, step_config, mask)
             reset_states = _state_features(reset_state)
-            states_after_reset = jnp.where(mask[:, None], reset_states, states_next)
-            residual_mask = mask[:, None]
-            reset_residuals = jnp.where(
-                residual_mask,
-                jnp.zeros_like(next_residuals),
-                next_residuals,
+            states_after_reset = jnp.where(mask[:, None], reset_states, next_features)
+            context_mask = mask[:, None]
+            reset_context = jnp.where(
+                context_mask,
+                jnp.zeros_like(next_context),
+                next_context,
             )
-            reset_returns = jnp.where(mask, jnp.zeros_like(ep_ret_next), ep_ret_next)
-            reset_lengths = jnp.where(mask, jnp.zeros_like(ep_len_next), ep_len_next)
+            reset_returns = jnp.where(mask, jnp.zeros_like(accumulated_return), accumulated_return)
+            reset_lengths = jnp.where(mask, jnp.zeros_like(accumulated_length), accumulated_length)
             return (
                 reset_state,
                 states_after_reset,
-                reset_residuals,
+                reset_context,
                 reset_returns,
                 reset_lengths,
             )
 
         (
-            next_env_state,
-            states_final,
-            next_residuals,
-            ep_ret_final,
-            ep_len_final,
+            state_after_reset,
+            features_after_reset,
+            context_after_reset,
+            return_after_reset,
+            length_after_reset,
         ) = jax.lax.cond(
             jnp.any(reset_mask),
             _reset_after_done,
             lambda _: (
                 next_env_state,
-                states_next,
-                next_residuals,
-                ep_ret_next,
-                ep_len_next,
+                next_features,
+                next_context,
+                accumulated_return,
+                accumulated_length,
             ),
             operand=reset_mask,
         )
@@ -243,70 +158,57 @@ def run_functional_rollout(
             actions=actions,
             values=values,
             logp=logp,
-            residuals=residuals,
+            context=context,
             episode_return=episode_return,
             done_flag=done_flag,
             done_mask=done_mask,
             terminated_mask=terminated_mask,
             truncated_mask=truncated_mask,
             bootstrap_value=bootstrap_values,
-            aux=step_aux,
+            labels=transition_labels,
         )
 
-        new_carry = (
-            next_env_state,
-            states_final,
-            next_residuals,
-            rng_key,
-            carry_extra,
-            ep_ret_final,
-            ep_len_final,
+        new_carry = RolloutCarry(
+            env_state=state_after_reset,
+            features=features_after_reset,
+            context=context_after_reset,
+            key=rng_key,
+            policy_state=policy_state,
+            episode_return=return_after_reset,
+            episode_length=length_after_reset,
         )
         return new_carry, step_record
 
-    initial_carry = _initial_episode_state()
-    (
-        final_state,
-        _final_states,
-        final_residuals,
-        final_rng,
-        final_extra,
-        _,
-        _,
-    ), steps = jax.lax.scan(
+    initial_carry = RolloutCarry(
+        env_state=initial_state,
+        features=_state_features(initial_state),
+        context=initial_context,
+        key=rng,
+        policy_state=policy_state,
+        episode_return=jnp.zeros((num_envs,), dtype=jnp.float32),
+        episode_length=jnp.zeros((num_envs,), dtype=jnp.int32),
+    )
+    final_carry, steps = jax.lax.scan(
         _scan_body,
         initial_carry,
         jnp.arange(num_steps, dtype=jnp.int32),
     )
 
-    step_outputs = steps.step_output
-    actions = steps.actions
-    values = steps.values
-    logp = steps.logp
-    residuals = steps.residuals
-    episode_returns = steps.episode_return
-    done_flags = steps.done_flag
-    done_masks = steps.done_mask
-    terminated_masks = steps.terminated_mask
-    truncated_masks = steps.truncated_mask
-    bootstrap_values = steps.bootstrap_value
-    aux = steps.aux
-
     return FunctionalRolloutResult(
-        step_outputs=step_outputs,
-        actions=actions,
-        values=values,
-        logp=logp,
-        residuals=residuals,
-        episode_returns=episode_returns,
-        done_flags=done_flags,
-        done_masks=done_masks,
-        terminated_masks=terminated_masks,
-        truncated_masks=truncated_masks,
-        bootstrap_values=bootstrap_values,
-        aux=aux,
-        final_state=final_state,
-        final_residuals=final_residuals,
-        final_rng=final_rng,
-        final_extra=final_extra,
+        step_outputs=steps.step_output,
+        actions=steps.actions,
+        values=steps.values,
+        logp=steps.logp,
+        context=steps.context,
+        episode_returns=steps.episode_return,
+        done_flags=steps.done_flag,
+        done_masks=steps.done_mask,
+        terminated_masks=steps.terminated_mask,
+        truncated_masks=steps.truncated_mask,
+        bootstrap_values=steps.bootstrap_value,
+        labels=steps.labels,
+        final_state=final_carry.env_state,
+        final_context=final_carry.context,
+        final_rng=final_carry.key,
+        final_policy_state=final_carry.policy_state,
     )

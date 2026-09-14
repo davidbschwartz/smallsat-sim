@@ -1,0 +1,122 @@
+# Simulation and controller settings. Matrices use !array.
+model: astrobee
+compiler:
+  convexhull: 'true'
+visual:
+  headlight:
+    ambient: 0.5 0.5 0.5
+    specular: 0.5 0.5 0.5
+    diffuse: 0.5 0.5 0.5
+gateway:
+  dock_sites:
+  - name: dock_orion_port_a
+    pos: [-12.8, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [-1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [1.0, 0.2, 0.2, 0.8]
+  - name: dock_orion_interface_a
+    pos: [-5.95, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [-1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.2, 1.0, 0.35, 0.85]
+  - name: dock_halo_ihab_interface_a
+    pos: [0.89, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [1.0, 0.75, 0.2, 0.85]
+  - name: dock_halo_ppe_interface_a
+    pos: [7.34, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.95, 0.55, 0.15, 0.85]
+  - name: dock_crew_airlock_a
+    pos: [-3.11, -6.97, -0.02]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [0.0, -1.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.4, 0.9, 1.0, 0.85]
+  - name: dock_hls_side_a
+    pos: [3.62, 7.82, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [0.0, 1.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.65, 1.0, 0.65, 0.85]
+  - name: dock_logistics_side_a
+    pos: [3.69, -10.03, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [0.0, -1.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.75, 0.85, 1.0, 0.85]
+  - name: dock_ppe_port_a
+    pos: [13.2, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.2, 0.7, 1.0, 0.8]
+Bodies:
+  num_bodies: 1
+  bodies_list:
+  - name: body0
+    pos: [3.6, 16, 0]
+    euler: [90, 0, -90]
+  position_noise: 0.7
+  attitude_noise_degrees: [-60, 60]
+control:
+  PD:
+    control_decimation: 10
+    gains:
+      Kp_x: 1.1740141118299998
+      Kd_x: 6.7086520676
+      Kp_q: 0.20774753152000003
+      Kd_q: 0.2596844144
+  LQR:
+    control_decimation: 25
+    cost:
+      Q: !diag [1.0, 1.0, 1.0, 4.0, 4.0, 4.0, 4.0, 10.0, 10.0, 10.0, 1.0, 1.0, 1.0]
+      R: !diag [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+      Q_e: !diag [1.0, 1.0, 1.0]
+  NominalMPC:
+    control_decimation: 25
+    Ts: 0.25
+    N: 80
+    cost:
+      Q: !diag [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+      R: !diag [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+      T: !diag [0.15000000000000002, 0.15000000000000002, 0.15000000000000002, 0.15000000000000002, 0.15000000000000002,
+        0.15000000000000002, 0.15000000000000002, 0.15000000000000002, 0.15000000000000002, 0.15000000000000002,
+        0.15000000000000002, 0.15000000000000002, 0.15000000000000002]
+      Q_e: !diag [1.0, 1.0, 1.0]
+  NominalMPCC:
+    control_decimation: 50
+    Ts: 0.5
+    N: 80
+    cost:
+      R: !diag [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+      q_l: 0.05
+      Q_c: !diag [0.09, 0.09, 0.09]
+      Q_omega: !diag [0.01, 0.01, 0.01]
+      q_theta: 0.05
+      Q_q: !diag [0.008, 0.008, 0.008, 0.008]
+  GPMPC:
+    control_decimation: 50
+    Ts: 0.5
+    N: 80
+    cost:
+      R: !diag [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+      q_l: 0.05
+      Q_c: !diag [0.09, 0.09, 0.09]
+      Q_omega: !diag [0.01, 0.01, 0.01]
+      q_theta: 0.05
+      Q_q: !diag [0.008, 0.008, 0.008, 0.008]

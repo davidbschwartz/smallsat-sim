@@ -1,0 +1,10 @@
+experiment: spacecraft_portability
+spacecraft:
+- astrobee
+- cubesat
+- sprint
+controllers:
+- pd
+trials: 20
+conditions:
+- randomized_initial

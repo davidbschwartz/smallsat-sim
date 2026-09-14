@@ -1,0 +1,18 @@
+experiment: exp3_rl_robustness
+algorithms:
+- ppo
+- sac
+regimes:
+- nominal
+- randomized
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+baselines:
+- pd
+- mpc
+trials: 100
+spacecraft: astrobee
