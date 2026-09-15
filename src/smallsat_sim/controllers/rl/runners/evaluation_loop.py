@@ -14,7 +14,16 @@ def evaluate_runner(
     allow_privileged_context=False,
     context_source=None,
     randomize=None,
+    scenarios=None,
+    batch_size=None,
+    steps=None,
 ):
+    """Restore a checkpoint and evaluate deterministically.
+
+    With scenarios, return (per-episode results, timings) using the MJX backend;
+    every scenario is scored once, independently of training randomization.
+    Without scenarios, retain the existing repeated-batch summary interface.
+    """
     if phase not in (1, 2):
         raise ValueError("Phase must be 1 or 2")
     source = context_source or ("privileged" if phase == 1 else "estimated")
@@ -22,7 +31,17 @@ def evaluate_runner(
         source = "zero"
     if source == "privileged" and not allow_privileged_context:
         raise ValueError("Privileged evaluation requires allow_privileged_context=True")
-    runner.restore("adaptation" if source == "estimated" else "policy")
+    if scenarios is not None and randomize is not None:
+        raise ValueError("Explicit scenarios cannot be combined with randomize")
+    if scenarios is None and (batch_size is not None or steps is not None):
+        raise ValueError("batch_size and steps require explicit scenarios")
+    runner.restore_for_evaluation(source)
+    if scenarios is not None:
+        from .scenario_evaluation import evaluate_scenarios
+
+        return evaluate_scenarios(
+            runner, scenarios, source=source, batch_size=batch_size, steps=steps
+        )
     collector = runner.collector(
         source,
         stochastic=False,
@@ -33,9 +52,7 @@ def evaluate_runner(
     for index in range(runner.training_cfg.n_evals):
         result = runner.collect(
             collector,
-            randomize=(
-                runner.env.train_with_failures if randomize is None else randomize
-            ),
+            randomize=(runner.env.train_with_failures if randomize is None else randomize),
         )
         metrics = rollout_metrics(result)
         if source == "estimated":
@@ -63,8 +80,6 @@ def evaluate_runner(
             )
             mask = valid.reshape(-1)[flat]
             errors = jnp.linalg.norm((runner.am(x) - y) * runner.context_scale, axis=-1)
-            metrics["mean_extrinsic_error"] = (errors * mask).sum() / jnp.maximum(
-                mask.sum(), 1
-            )
+            metrics["mean_extrinsic_error"] = (errors * mask).sum() / jnp.maximum(mask.sum(), 1)
         rows.append(report(runner, "evaluation_" + source, index + 1, metrics))
     return rows

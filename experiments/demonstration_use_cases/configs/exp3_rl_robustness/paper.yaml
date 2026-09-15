@@ -1,5 +1,9 @@
 experiment: exp3_rl_robustness
 evaluation_backend: mjx
+# One deterministic reference, 100 distinct paired scenarios in every other suite.
+evaluation_trials:
+  nominal: 1
+evaluation_batch_size: 128
 # SAC counts short collection chunks as updates; avoid rewriting its full replay
 # buffer every ten chunks. Both algorithms also save at the end of training.
 checkpoint_intervals:

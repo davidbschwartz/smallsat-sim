@@ -1,4 +1,4 @@
-# Exterior-port contact approach with a rate-limited reference.
+# Crew-airlock contact approach with a rate-limited reference.
 experiment: exp4_docking
 spacecraft: astrobee
 controller: mpc
@@ -7,8 +7,10 @@ sensitivity_trials: 50
 steps: 560
 sim_dt: 0.01
 control_decimation: 25
-dock_site: dock_orion_port_a
-dock_surface_offset: -0.4856988727161661
+dock_site: dock_crew_airlock_a
+# Astrobee center at first contact is 0.1624087775917904 m outward
+# from the site; command 5 mm inward to maintain contact.
+dock_surface_offset: -0.1574087775917904
 approach_offset: 1.0
 approach_speed: 0.015
 initial_radius:

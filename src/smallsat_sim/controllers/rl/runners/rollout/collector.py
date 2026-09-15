@@ -1,5 +1,7 @@
 """Build once; model states, simulation states and RNGs are runtime arguments."""
 
+from dataclasses import replace
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -19,25 +21,32 @@ def make_collector(
     stochastic=True,
     demonstration=None,
     visualization=None,
+    single_episode=False,
+    step_config=None,
+    backend=None,
+    record_state_fn=None,
 ):
     if context_source not in ("privileged", "estimated", "zero"):
         raise ValueError("Unknown context source")
     if env.use_adaptive_approach and context_source == "estimated" and am is None:
         raise ValueError("Estimated context requires an adaptation module")
     # Backend and model structure are fixed; their array state is a runtime input.
-    config = env.build_step_config()
-    backend = env.rollout_backend()
+    config = step_config or env.build_step_config()
+    backend = backend or env.rollout_backend()
+    num_envs = config.num_envs
     features, physics_step, reset_fn = backend.state_features, backend.step, backend.reset
     max_episode_len = agent.max_ep_len if agent is not None else env.max_episode_len
 
     actor_graph = nnx.graphdef(agent.actor) if agent is not None else None
-    critic_graph = nnx.graphdef(agent.critic) if agent is not None else None
+    critic_graph = (nnx.graphdef(agent.critic)
+                    if agent is not None and hasattr(agent, "critic") and not single_episode else None)
     am_graph = nnx.graphdef(am) if am is not None else None
     scale = jnp.asarray(env.env_cfg.context.scale, dtype=jnp.float32)[: env.res_dim]
     adaptive = env.use_adaptive_approach
 
     @jax.jit
-    def collect(state, actor_state, critic_state, am_state, key, reference):
+    def collect(state, actor_state, critic_state, am_state, key, reference, model=None):
+        runtime_config = replace(config, mjx_model=model) if model is not None else config
         actor = nnx.merge(actor_graph, actor_state) if actor_graph is not None else None
         critic = (
             nnx.merge(critic_graph, critic_state) if critic_graph is not None else None
@@ -52,9 +61,14 @@ def make_collector(
             key, sample_key = jax.random.split(key)
             if demonstration is not None:
                 actions = demonstration(observations[:, : env.obs_dim])
-                latent, logp = jnp.zeros_like(actions), jnp.zeros((env.num_envs,))
+                latent, logp = jnp.zeros_like(actions), jnp.zeros((num_envs,))
             elif stochastic:
                 actions, latent, logp = actor.sample(observations, sample_key)
+            elif single_episode:
+                actions = actor.deterministic_action(observations)
+                if actions.shape != (num_envs, env.act_dim):
+                    raise ValueError("Actor must return one actuator-command vector per lane")
+                latent, logp = jnp.zeros_like(actions), jnp.zeros((num_envs,))
             else:
                 latent = actor.mu_net(observations)
                 actions = actor.apply_action_bounds(latent)
@@ -62,7 +76,7 @@ def make_collector(
             values = (
                 critic(observations)
                 if critic is not None
-                else jnp.zeros((env.num_envs,))
+                else jnp.zeros((num_envs,))
             )
             next_policy_state = PolicyState(
                 history=policy_state.history, latent_actions=latent,
@@ -87,7 +101,7 @@ def make_collector(
                 )
             else:
                 next_context, true_residual = context, context
-                history_full = jnp.zeros((env.num_envs,), dtype=bool)
+                history_full = jnp.zeros((num_envs,), dtype=bool)
             return (
                 next_context,
                 TransitionLabels(
@@ -104,25 +118,25 @@ def make_collector(
             values = (
                 critic(observations)
                 if critic is not None
-                else jnp.zeros((env.num_envs,))
+                else jnp.zeros((num_envs,))
             )
             return values, key, policy_state
 
         history = ContextHistory(
             values=jnp.zeros(
                 (
-                    env.num_envs,
+                    num_envs,
                     env.history_len if adaptive else 0,
                     env.obs_dim + env.act_dim if adaptive else 0,
                 )
             ),
-            counts=jnp.zeros((env.num_envs,), dtype=jnp.int32),
+            counts=jnp.zeros((num_envs,), dtype=jnp.int32),
         )
         return run_functional_rollout(
-            step_config=config,
-            max_episode_len=max_episode_len,
+            step_config=runtime_config,
+            max_episode_len=steps if single_episode else max_episode_len,
             initial_state=state,
-            initial_context=jnp.zeros((env.num_envs, env.res_dim)),
+            initial_context=jnp.zeros((num_envs, env.res_dim)),
             rng=key,
             num_steps=steps,
             reference_waypoint=reference,
@@ -134,12 +148,14 @@ def make_collector(
             ),
             policy_state=PolicyState(
                 history=history,
-                latent_actions=jnp.zeros((env.num_envs, env.act_dim)),
+                latent_actions=jnp.zeros((num_envs, env.act_dim)),
             ),
             state_features_fn=features,
             step_fn=physics_step,
             reset_fn=reset_fn,
             visualization=visualization,
+            single_episode=single_episode,
+            record_state_fn=record_state_fn,
         )
 
     return collect

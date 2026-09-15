@@ -49,7 +49,7 @@ python -m experiments.demonstration_use_cases.aggregate --mode smoke --allow-par
 
 Allow seconds to minutes for smoke checks and potentially hours to days for
 full campaigns, depending on hardware. These are planning estimates, not measured
-runtime guarantees. The learning campaign includes 20 training runs and 10,000
+runtime guarantees. The learning campaign includes 20 training runs and 8,020
 learned-policy evaluation episodes: PPO and SAC, each trained nominally and with
 randomization on seeds 0–4. PD and MPC remain evaluation baselines. All requested jobs are attempted and failures
 are reported, so a missing prerequisite does not discard other
@@ -62,21 +62,110 @@ transition budget. Smoke runs use two environments.
 SAC uses separate 256-by-256 networks via `protocol.policy_hidden_sizes`; PPO
 retains its existing 64-by-64 networks.
 
-Learned-policy evaluation uses batched MJX: all trials for a condition advance
-together, with deterministic actions and no episode resets. Training retains its
-configured backend (currently `freeflyer`). Classical PD/MPC baselines and contact
-experiments use native MuJoCo. A development config can set
-`protocol.evaluation_backend: mujoco_native` for cross-backend checks. Both learned
-evaluation paths use identical sampled scenarios, pose metrics, first-episode
-termination, and recording formats. Timings are retained in run metadata;
-MJX batch timings include preparation and compilation.
+Learned-policy evaluation restores the saved checkpoint through `runner.evaluate(scenarios=...)`.
+All conditions are packed into batches of up to 128 MJX environments with
+batched deterministic actor inference and no episode resets. The experiment's
+`mjx_evaluation.py` only samples scenarios and writes results; `runtime.py`'s
+control loop is for classical controllers. Training retains its configured
+backend (currently `freeflyer`). PD/MPC baselines and contact experiments use
+native MuJoCo; they are not silently replaced with a different GPU controller.
+The library uses its existing rollout collector, MJX stepping and registered task
+termination. Native MuJoCo parity checks live in tests.
+
+`protocol.evaluation_trials.nominal: 1` overrides the default `trials: 100`.
+Each learned policy and each PD/MPC baseline therefore evaluates **401 scenarios**:
+one fixed nominal reference and 100 each for randomized initial state, thrust
+variation, disturbance and combined effects. Initial conditions are paired across
+policies and the four randomized suites. This changes neither training nor the
+success definition. There is no newly invented OOD condition.
+The final batch can have padding lanes for compilation reuse; they are discarded,
+never exported and never counted as trials. `samples.jsonl` records stable
+`scenario_id` and `initial_state_id` hashes for learned-policy evaluations; duplicate
+physical scenarios within a new suite are rejected. `evaluation_timing.json`
+separates preparation, synchronized rollout (including first-use compilation),
+and metric reduction. Run metadata additionally records total evaluation wall time
+including file output. These timings are not pure steady-state throughput benchmarks.
+
+### GPU verification and the new campaign
+
+```bash
+# Confirm that this process actually sees the accelerator.
+python -c "import jax; print(jax.devices()); assert jax.default_backend() == 'gpu'"
+
+# Cross-backend dynamics, first-terminal-event, padding and failure checks.
+python -m pytest src/tests/test_rl_scenario_evaluation.py -q
+
+# Small end-to-end runs for both algorithms, including real checkpoint writes.
+python -m experiments.demonstration_use_cases.exp3_rl_robustness --smoke \
+  --output results/demonstration_mjx_v2_smoke \
+  --job-id controller-ppo_regime-nominal_seed-0_spacecraft-astrobee \
+  --job-id controller-sac_regime-nominal_seed-0_spacecraft-astrobee
+
+# Inspect the 20 policy jobs + two classical baselines, then launch.
+python -m experiments.demonstration_use_cases.exp3_rl_robustness --paper --plan
+python -m experiments.demonstration_use_cases.exp3_rl_robustness --paper \
+  --output results/demonstration_mjx_v2 --resume
+```
+
+Use a new results root: the changed evaluation protocol has a new config identity,
+and resume correctly refuses to mix it with the old 100-identical-reference-trial
+campaign. Historical configs without per-condition overrides retain their old
+counts when validated. The full command also runs PD/MPC, requiring the MPC setup
+above; `--job-id` can select just the learned policies.
+
+
+### Re-evaluate a saved policy without training
+
+```bash
+python -m experiments.demonstration_use_cases.exp3_rl_robustness \
+  --evaluate-run PATH_TO_SAVED_RUN \
+  --output results/demonstration_reevaluation
+```
+
+The saved run must include `metadata.json`, `job.json`, `resolved_config.yaml`,
+`runtime_config.yaml`, and its policy checkpoint. A run whose evaluation failed
+can be used as long as its checkpoint was saved. The command creates a fresh run,
+records the source/checkpoint paths, and copies the available training trace for
+aggregation. It neither trains nor modifies the source run. Archived runs can be
+moved between machines; their original configuration identity is preserved.
+Keep the source checkpoint with the new results: it is referenced, not duplicated.
+Use a separate output root to avoid duplicate policies in campaign aggregation.
+
+By default, evaluation uses the saved protocol. To adjust it, copy the saved
+`resolved_config.yaml`, edit only the following fields, and pass `--config FILE`:
+
+- `common.evaluation_distributions`, `evaluation_seed_start`, `episode_steps`.
+- `protocol.trials`, `evaluation_trials`, `evaluation_batch_size`, `evaluation_backend` (MJX).
+
+Overrides are recorded as development runs. Training settings, physical assets,
+and task thresholds must match the saved run. Do not combine `--evaluate-run`
+with `--paper`, `--smoke`, `--resume`, `--plan`, or `--job-id`.
+
+For a GPU check, re-evaluate one full saved policy with the 401-scenario protocol
+before launching the campaign. Inspect `evaluation_timing.json` for preparation
+and synchronized batch times (first-use compilation is included).
+
+Reference timings from the saved A100-SXM4-40GB campaign were 4.5–4.6 minutes per
+PPO policy, 24.7–25.3 minutes per SAC policy, and 18–27 seconds per old MJX
+evaluation. Twenty training jobs were roughly five hours sequentially. New GPU
+measurements are required; compilation, output storage and hardware matter.
+
+Archive **every seed's** `policy_checkpoint_path` from metadata, together with
+`resolved_config.yaml`, `runtime_config.yaml`, the asset, model XML and source
+hashes. SAC already writes a small `_actor` checkpoint as well as its full training
+state; the new metadata points explicitly to that inference checkpoint. PPO's
+policy path is its standard training checkpoint; evaluation restores only actor
+weights (plus estimator weights for adaptive policies), leaving training state intact. The full SAC checkpoint (including
+replay/optimizer state) is needed to resume training, but not to retain the trained
+actor for evaluation. No checkpoint is selected by evaluation performance.
 
 The main RL demonstration compares fixed nominal and randomized starting poses,
 ±10% thrust variation, bounded world-frame disturbances (±0.005 N per force axis,
 ±0.0005 N m per torque axis), and their combination. Randomized training uses
 these same bounds. Mass and inertia stay fixed.
-The fixed nominal condition repeats the same deterministic starting state; its
-trial count is not a count of independent scenarios. Use `randomized_initial`
+The fixed nominal condition runs once per checkpoint. Across five training seeds,
+its success rate describes five policies on one starting situation, not 500
+independent scenarios. Use `randomized_initial`
 to assess nominal-dynamics reliability across starting poses, rather than
 pooling the repeated fixed probe into an overall success rate.
 This is a demonstration of a usable robust-control workflow, not a claim to solve

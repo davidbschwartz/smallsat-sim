@@ -14,7 +14,9 @@ import pandas as pd
 import yaml
 from scipy.stats import t
 
-from .common import EXPERIMENTS, digest, git_info, job_id, jobs, load_config, write_json
+from .common import (
+    EXPERIMENTS, digest, evaluation_trial_count, git_info, job_id, jobs, load_config, write_json,
+)
 
 
 def records(path):
@@ -59,7 +61,9 @@ def validate_rows(config, job, rows):
         expected = {
             (condition, config["common"]["evaluation_seed_start"] + i)
             for condition in conditions
-            for i in range(count)
+            for i in range(
+                count if experiment == "exp4_docking" else evaluation_trial_count(config, condition)
+            )
         }
         actual = {(r.get("condition"), r.get("evaluation_seed")) for r in rows}
     if actual != expected or len(rows) != len(expected):

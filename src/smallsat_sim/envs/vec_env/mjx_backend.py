@@ -13,9 +13,6 @@ from smallsat_sim.envs.vec_env.observations import mjx_observations, mjx_state_f
 from .config import VecEnvStepConfig
 from smallsat_sim.envs.vec_env.types import VecEnvState, VecEnvStepOutput
 
-# JIT-friendly MuJoCo step that advances each environment in parallel.
-VMAP_MJX_STEP = jax.vmap(mjx.step, in_axes=(None, 0))
-
 
 @partial(jax.jit, static_argnames=("num_envs", "max_start_linear_velocity", "max_start_angular_velocity"))
 def reset_from_key(
@@ -87,7 +84,8 @@ def _advance_and_evaluate(state, commanded_ctrl, next_waypoint, config,
         qfrc_applied=qfrc_applied,
     )
 
-    mjx_batch = advance_physics(config.mjx_model, mjx_batch, config.control_decimation)
+    mjx_batch = advance_physics(config.mjx_model, mjx_batch, config.control_decimation,
+                                config.batched_model_fields)
 
     next_state = prepared_state.replace(mjx_batch=mjx_batch)
     next_states = mjx_state_features(mjx_batch, next_waypoint)
@@ -157,12 +155,15 @@ def step(state, actions, reference, config, previous_residual=None, previous_fea
     return next_state, output, following
 
 
-@partial(jax.jit, static_argnames=("control_decimation",))
-def advance_physics(model, batch, control_decimation):
+@partial(jax.jit, static_argnames=("control_decimation", "batched_model_fields"))
+def advance_physics(model, batch, control_decimation, batched_model_fields=()):
     """Integrate one held world wrench and actuator command across physics substeps."""
+    axes = (jax.tree.map(lambda _: None, model).replace(
+        **dict.fromkeys(batched_model_fields, 0)) if batched_model_fields else None)
+    advance = jax.vmap(mjx.step, in_axes=(axes, 0))
     torque_world = jnp.einsum("bij,bj->bi", batch.xmat[:, 1], batch.qfrc_applied[:, 3:])
     def substep(_, current):
         torque_body = jnp.einsum("bji,bj->bi", current.xmat[:, 1], torque_world)
         current = current.replace(qfrc_applied=current.qfrc_applied.at[:, 3:].set(torque_body))
-        return VMAP_MJX_STEP(model, current)
+        return advance(model, current)
     return jax.lax.fori_loop(0, control_decimation, substep, batch)

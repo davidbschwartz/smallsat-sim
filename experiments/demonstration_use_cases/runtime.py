@@ -1,7 +1,8 @@
-"""Experiment runner setup and deterministic native evaluation.
+"""Experiment runner setup and classical-controller native evaluation.
 
-Training and control use SmallSatSim implementations. The evaluation loop owns
-paired scenario resets, fault onset, stopping criteria, and artifact recording.
+Learned policies use runner.evaluate() through the scenario/artifact adapter.
+The classical evaluation loop owns paired scenario resets, fault onset,
+stopping criteria, and artifact recording.
 """
 
 from copy import deepcopy
@@ -10,8 +11,6 @@ from types import SimpleNamespace
 from time import perf_counter
 import os
 
-import jax.numpy as jnp
-from flax import nnx
 import mujoco
 import yaml
 import numpy as np
@@ -27,11 +26,10 @@ from smallsat_sim.controllers.nominal_mpc.reference import MPCSolverError
 from smallsat_sim.model.mujoco_xml import build_mujoco_xml
 from smallsat_sim.model.vehicle import load_vehicle
 
-from .common import plain
+from .common import evaluation_trial_count, plain
 from .effects import training_effects
-from .mjx_evaluation import evaluate_mjx
 from .replay import EpisodeRecording
-from .task import PoseMetrics, features, register_task, sample_trial
+from .task import PoseMetrics, register_task, sample_trial
 
 
 def vehicle(config, name, directory):
@@ -40,7 +38,7 @@ def vehicle(config, name, directory):
     return load_vehicle(path)
 
 
-def build_runner(config, job, run):
+def build_runner(config, job, run, *, saved_run=None):
     register_task()
     common = deepcopy(config["common"])
     env_config = settings(common["env"])
@@ -53,6 +51,10 @@ def build_runner(config, job, run):
         "checkpoint_intervals", {}
     ).get(algorithm, training_config.training_checkpoint_interval)
     training_config.checkpoint_dir = str((run.path / "checkpoint").resolve())
+    if saved_run is not None:
+        # Preserve checkpoint identity even when the archived run moved machines.
+        saved_settings = yaml.safe_load((saved_run.path / "runtime_config.yaml").read_text())
+        training_config.checkpoint_dir = saved_settings["training"]["checkpoint_dir"]
     env_config.sim.seed = job["seed"]
     env_config.model = job["spacecraft"]
     env_config.environment.num_envs = job.get(
@@ -74,7 +76,7 @@ def build_runner(config, job, run):
         training_config.PPO.steps_per_epoch = steps
         training_config.PPO.max_ep_len = steps
         env_config.max_episode_len = steps
-    wandb_mode = config["protocol"].get("wandb_mode", "disabled")
+    wandb_mode = "disabled" if saved_run is not None else config["protocol"].get("wandb_mode", "disabled")
     if wandb_mode != "disabled":
         directory = (run.path / "wandb").resolve()
         directory.mkdir(parents=True, exist_ok=True)
@@ -84,8 +86,14 @@ def build_runner(config, job, run):
         headless=True, num_bodies=1, log=False, wandb=wandb_mode != "disabled", video=False, viewer=False
     )
     asset = vehicle(config, job["spacecraft"], run.path)
-    env = AstrobeeEnvVectorized(args=args, config=env_config, vehicle=asset, run_name=run.path.name)
+    env = AstrobeeEnvVectorized(
+        args=args, config=env_config, vehicle=asset,
+        run_name=saved_run.meta["run_id"] if saved_run is not None else run.path.name,
+    )
     try:
+        (run.path / "model.xml").write_text(
+            build_mujoco_xml(env.env_cfg, env.model_cfg, scene="training")
+        )
         planner = OraclePlannerRL(env, radius=0.0)
         runner = make_runner(env, planner, config=training_config)
         run.update(training_num_envs=env.num_envs)
@@ -213,17 +221,14 @@ def fault_mapping(vehicle, condition, sample, common):
     return apply
 
 
-def evaluate(config, job, run, *, actor=None):
-    if actor is not None and config["protocol"].get("evaluation_backend") == "mjx":
-        return evaluate_mjx(config, job, run, actor)
+def evaluate(config, job, run):
+    """Evaluate classical controllers with native MuJoCo."""
     evaluation_start = perf_counter()
     common, protocol = config["common"], config["protocol"]
     env = NativeEnvironment(config, job["spacecraft"], run)
     reference = np.asarray(common["reference"])
     planner = SetpointPlanner(reference)
-    policy = None if actor else controller(env, planner, job["controller"])
-    if actor:
-        action = nnx.jit(lambda obs: actor.deterministic_action(obs))
+    policy = controller(env, planner, job["controller"])
     conditions = (
         [job["condition"]] if "condition" in job else list(common["evaluation_distributions"])
     )
@@ -234,7 +239,7 @@ def evaluate(config, job, run, *, actor=None):
         # Exp2 nominal includes the same randomized initial conditions as every fault.
         if protocol["experiment"] == "exp2_fault_robustness" and condition == "nominal":
             distribution = {}
-        for trial in range(protocol["trials"]):
+        for trial in range(evaluation_trial_count(config, condition)):
             trial_start = perf_counter()
             seed = common["evaluation_seed_start"] + trial
             sample = sample_trial(common, seed, distribution, env.model.nu)
@@ -251,11 +256,7 @@ def evaluate(config, job, run, *, actor=None):
             for _ in range(common["episode_steps"]):
                 obs = env.get_obs()
                 try:
-                    command = (
-                        np.asarray(action(jnp.asarray(features(obs, reference)[None])))[0]
-                        if actor
-                        else policy.get_control_input(env)
-                    )
+                    command = policy.get_control_input(env)
                 except MPCSolverError as error:
                     solver_status = error.status
                     reason = "solver_failure"
@@ -293,7 +294,7 @@ def evaluate(config, job, run, *, actor=None):
                     trial=trial,
                     evaluation_seed=seed,
                     initial_condition_seed=seed,
-                    training_seed=job["seed"] if actor else None,
+                    training_seed=None,
                     solver_status=solver_status,
                     mean_solve_seconds=float(np.mean(solve_times)) if solve_times else None,
                     max_solve_seconds=max(solve_times) if solve_times else None,

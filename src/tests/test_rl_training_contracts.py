@@ -297,3 +297,53 @@ def test_deployment_rejects_mismatched_teacher(runner):
     )
     with pytest.raises(ValueError, match="different teacher policy"):
         controller.control()
+
+
+def test_evaluation_restore_changes_only_inference_weights(runner, tmp_path):
+    from smallsat_sim.controllers.rl.runners.runner_utils import (
+        _save, _extract_optimizer_state, _restore_optimizer,
+    )
+
+    actor_id = model_fingerprint(runner.agent.actor)
+    runner.save("policy")
+    runner.save("adaptation")
+    estimator_id = model_fingerprint(runner.am)
+    # A policy-only payload must suffice; no critic or optimizer keys are needed.
+    _save(tmp_path, "actor_only", dict(actor_model=nnx.state(runner.agent.actor),
+                                      metadata=dict(config_id=runner.config_id)))
+    nnx.update(runner.agent.actor, jax.tree.map(lambda x: x * 0, nnx.state(runner.agent.actor)))
+    nnx.update(runner.am, jax.tree.map(lambda x: x * 0, nnx.state(runner.am)))
+    runner.policy_epoch, runner.adaptation_epoch = 123, 456
+    runner._take_keys()
+    runner.env._rng = jax.random.PRNGKey(99)
+    runner.agent.key = jax.random.PRNGKey(98)
+    optimizers = (runner.agent.actor_optimizer, runner.agent.critic_optimizer, runner.am_optimizer)
+    # NNX optimizers contain a reference to the live model; compare their own
+    # counters/moments, excluding the inference weights deliberately restored.
+    for optimizer in optimizers:
+        _restore_optimizer(optimizer, jax.tree.map(np.ones_like, _extract_optimizer_state(optimizer)))
+    nnx.update(runner.agent.critic, jax.tree.map(lambda x: x * 0, nnx.state(runner.agent.critic)))
+    def untouched():
+        return nnx.state(runner.agent.critic), tuple(_extract_optimizer_state(o) for o in optimizers)
+    before = jax.tree.map(lambda x: np.asarray(x).copy(), untouched())
+    keys = [np.asarray(k).copy() for k in (runner._rng, runner.env._rng, runner.agent.key)]
+    runner.evaluation_checkpoint = tmp_path / "actor_only"
+    runner.restore_for_evaluation("zero")
+    assert model_fingerprint(runner.agent.actor) == actor_id
+    runner.evaluation_checkpoint = None
+    runner.restore_for_evaluation("estimated")
+    assert model_fingerprint(runner.am) == estimator_id
+    assert (runner.policy_epoch, runner.adaptation_epoch) == (123, 456)
+    for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(untouched()), strict=True):
+        np.testing.assert_array_equal(a, b)
+    for a, b in zip(keys, (runner._rng, runner.env._rng, runner.agent.key), strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_evaluation_rejects_estimator_from_another_teacher(runner):
+    runner.save("policy")
+    runner.save("adaptation")
+    nnx.update(runner.agent.actor, jax.tree.map(lambda x: x * 0, nnx.state(runner.agent.actor)))
+    runner.save("policy")
+    with pytest.raises(ValueError, match="different teacher"):
+        runner.restore_for_evaluation("estimated")

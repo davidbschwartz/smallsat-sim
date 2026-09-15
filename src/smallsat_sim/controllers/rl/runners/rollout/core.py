@@ -31,12 +31,16 @@ def run_functional_rollout(
     step_fn: StepFn,
     reset_fn: ResetFn,
     visualization: Any = None,
+    single_episode: bool = False,
+    record_state_fn: Any = None,
 ) -> FunctionalRolloutResult:
     """Collect a fixed horizon with independent episode boundaries per environment.
 
     Policy callbacks own context/history; this scan owns action intervals, episode boundaries,
     timeout bootstrap and reset ordering. Arrays are [environment, features]
     inside the scan and [time, environment, features] in the result.
+    single_episode disables resets; evaluation reductions keep only the first
+    terminal event in each lane. Optional trajectory recording is evaluation-only.
     """
 
     # Every backend accepts the full state and supports independently masked resets.
@@ -63,7 +67,12 @@ def run_functional_rollout(
         )
 
         next_env_state, step_output, next_features = step_fn(
-            env_state, actions, reference_waypoint, step_config, context, current_features
+            env_state,
+            jnp.nan_to_num(actions) if single_episode else actions,
+            reference_waypoint,
+            step_config,
+            context,
+            current_features,
         )
 
         # Track episode boundaries independently for each environment.
@@ -79,7 +88,11 @@ def run_functional_rollout(
 
         last_step = jnp.equal(step_idx, num_steps - 1)
         done_flag = jnp.any(done_mask)
-        reset_mask = jnp.logical_and(done_mask, jnp.logical_not(last_step))
+        reset_mask = (
+            jnp.zeros_like(done_mask)
+            if single_episode
+            else jnp.logical_and(done_mask, jnp.logical_not(last_step))
+        )
 
         # A completed transition supplies the next context and adaptation label.
         next_context, transition_labels, policy_state = callbacks.update_context(
@@ -91,6 +104,7 @@ def run_functional_rollout(
             truncated_mask,
             jnp.logical_and(last_step, jnp.logical_not(terminated_mask)),
         )
+
         def _skip_bootstrap(operand):
             _, _, key, current_policy_state = operand
             return jnp.zeros_like(step_output.rewards), key, current_policy_state
@@ -140,17 +154,21 @@ def run_functional_rollout(
             context_after_reset,
             return_after_reset,
             length_after_reset,
-        ) = jax.lax.cond(
-            jnp.any(reset_mask),
-            _reset_after_done,
-            lambda _: (
-                next_env_state,
-                next_features,
-                next_context,
-                accumulated_return,
-                accumulated_length,
-            ),
-            operand=reset_mask,
+        ) = (
+            (next_env_state, next_features, next_context, accumulated_return, accumulated_length)
+            if single_episode
+            else jax.lax.cond(
+                jnp.any(reset_mask),
+                _reset_after_done,
+                lambda _: (
+                    next_env_state,
+                    next_features,
+                    next_context,
+                    accumulated_return,
+                    accumulated_length,
+                ),
+                operand=reset_mask,
+            )
         )
 
         step_record = _FunctionalRolloutStep(
@@ -166,6 +184,7 @@ def run_functional_rollout(
             truncated_mask=truncated_mask,
             bootstrap_value=bootstrap_values,
             labels=transition_labels,
+            trajectory=record_state_fn(next_env_state) if record_state_fn else None,
         )
 
         new_carry = RolloutCarry(
@@ -211,4 +230,5 @@ def run_functional_rollout(
         final_context=final_carry.context,
         final_rng=final_carry.key,
         final_policy_state=final_carry.policy_state,
+        trajectory=steps.trajectory,
     )

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from smallsat_sim.controllers.rl.runners import rollout as ru
 
@@ -59,7 +60,8 @@ class DummyStepOutput:
 jax.tree_util.register_dataclass(DummyStepOutput)
 
 
-def test_run_functional_rollout_resets_and_reports_returns() -> None:
+@pytest.mark.parametrize("single_episode", [False, True])
+def test_run_functional_rollout_resets_and_reports_returns(single_episode) -> None:
     num_envs = 2
     num_steps = 3
 
@@ -138,6 +140,7 @@ def test_run_functional_rollout_resets_and_reports_returns() -> None:
         state_features_fn=lambda state, _: state.mjx_batch.qpos,
         step_fn=_vecenv_step_stub,
         reset_fn=_vecenv_reset_stub,
+        single_episode=single_episode,
     )
 
     assert bool(result.done_flags[0])
@@ -146,8 +149,8 @@ def test_run_functional_rollout_resets_and_reports_returns() -> None:
     assert not bool(result.truncated_masks[0].any())
     assert jnp.allclose(result.episode_returns[0], jnp.full((num_envs,), 2.0))
     assert jnp.allclose(result.episode_returns[1], jnp.zeros((num_envs,)))
-    assert jnp.allclose(result.episode_returns[2], jnp.full((num_envs,), 4.0))
-    assert jnp.allclose(result.final_state.mjx_batch.qpos, jnp.ones((num_envs, 1)))
+    assert jnp.allclose(result.episode_returns[2], jnp.full((num_envs,), 0.0 if single_episode else 4.0))
+    assert jnp.allclose(result.final_state.mjx_batch.qpos, jnp.full((num_envs, 1), 3.0 if single_episode else 1.0))
 
 
 def test_run_functional_rollout_bootstraps_timeouts() -> None:

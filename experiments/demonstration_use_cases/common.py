@@ -119,6 +119,12 @@ def _configure_smoke(config, experiment):
     common["training"]["episode_len"] = 8
     if "trials" in protocol:
         protocol["trials"] = 2
+        if "evaluation_trials" in protocol:
+            protocol["evaluation_trials"] = {
+                k: min(v, 2) for k, v in protocol["evaluation_trials"].items()
+            }
+        if "evaluation_batch_size" in protocol:
+            protocol["evaluation_batch_size"] = 2
     if experiment == "exp1_scaling":
         protocol.update(
             batch_sizes=[1, 8], rollout_steps=8, repeats=2, warmups=1, require_gpu=False
@@ -128,6 +134,12 @@ def _configure_smoke(config, experiment):
         protocol["training_num_envs"] = {key: 2 for key in protocol.get("training_num_envs", {})}
     if experiment == "exp4_docking":
         protocol.update(default_trials=2, sensitivity_trials=2, steps=8)
+
+
+def evaluation_trial_count(config, condition):
+    """Per-condition episode counts; absent overrides preserve historical protocols."""
+    protocol = config["protocol"]
+    return protocol.get("evaluation_trials", {}).get(condition, protocol["trials"])
 
 
 def validate_config(config):
@@ -143,6 +155,18 @@ def validate_config(config):
         raise ValueError("sac_curriculum is no longer supported; use a configuration without curriculum")
     if protocol.get("evaluation_backend", "mujoco_native") not in ("mjx", "mujoco_native"):
         raise ValueError("evaluation_backend must be mjx or mujoco_native")
+    if (protocol["experiment"] == "exp3_rl_robustness"
+            and protocol.get("evaluation_backend", "mjx") != "mjx"):
+        raise ValueError("RL scenario evaluation uses MJX; classical baselines use native MuJoCo")
+    overrides = protocol.get('evaluation_trials', {})
+    if not isinstance(overrides, dict) or set(overrides) - set(common['evaluation_distributions']):
+        raise ValueError('evaluation_trials must map known conditions to positive counts')
+    for count in overrides.values():
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError('evaluation_trials must contain positive integers')
+    batch_size = protocol.get('evaluation_batch_size', 128)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError('evaluation_batch_size must be a positive integer')
     if protocol.get("wandb_mode", "disabled") not in ("disabled", "offline", "online"):
         raise ValueError("wandb_mode must be disabled, offline or online")
     for interval in protocol.get("checkpoint_intervals", {}).values():

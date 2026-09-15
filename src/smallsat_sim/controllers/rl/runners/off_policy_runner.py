@@ -17,6 +17,7 @@ from ..storage.replay_buffer import empty_replay, insert, sample, ReplayState, T
 from .rollout.off_policy_effects import batched_effect_state
 from .rollout.off_policy import initial_carry, make_off_policy_collector
 from .runner_metrics import report, rollout_metrics
+from .evaluation_loop import evaluate_runner
 from .runner_setup import build_checkpoint_file_names, configure_jax_compilation_cache
 from .runner_utils import _save, load_trained_modules, checkpoint_exists, _checked_state
 from smallsat_sim.envs.effects.scheduling import reset_and_randomize
@@ -270,13 +271,7 @@ class OffPolicyRunner:
         self.policy_epoch = epoch
 
     def evaluate(self, phase=2, *, randomize=None, **kwargs):
-        if phase not in (1, 2):
-            raise ValueError('Phase must be 1 or 2')
-        self.restore_for_evaluation('zero')
-        collector = self.collector(steps=self.training_cfg.episode_len)
-        return [report(self, 'evaluation_zero', i + 1, rollout_metrics(self.collect(
-            collector, randomize=self.env.train_with_failures if randomize is None else randomize)))
-            for i in range(self.training_cfg.n_evals)]
+        return evaluate_runner(self, phase, randomize=randomize, **kwargs)
 
     def restore_for_evaluation(self, source='zero'):
         if self.evaluation_checkpoint is not None:

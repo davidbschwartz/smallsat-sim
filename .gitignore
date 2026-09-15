@@ -75,3 +75,8 @@ results/controller_pilots/
 # Published pilot evidence belongs with its configurations.
 !experiments/demonstration_use_cases/pilots/**/trials.csv
 !experiments/demonstration_use_cases/pilots/**/summary.csv
+
+# Local publication workspace, source archives, and unpublished planning notes.
+/paper/
+/smallsat-demonstration/
+/smallsatsim_icra2027_experiment_artifacts.md

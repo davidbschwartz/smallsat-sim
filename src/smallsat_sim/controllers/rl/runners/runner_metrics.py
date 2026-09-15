@@ -126,3 +126,53 @@ def episode_metrics(result, *, dt, onset_seconds):
         # Interpret only alongside recovered_envs; zero means no measured recoveries when count=0.
         "mean_recovery_seconds": recovery_times.sum() / jnp.maximum(recovered.sum(), 1),
     }
+
+
+def scenario_metrics(output, actions, trajectory, *, initial_poses, dt):
+    """Score the first episode in each lane using the environment's terminal flags.
+
+    Later scan samples never affect a finished episode. Nonfinite transitions
+    fail the episode and are excluded from metrics and recordings.
+    """
+    import numpy as np
+
+    poses, velocities = trajectory
+    steps, lanes = actions.shape[:2]
+    valid_control = np.isfinite(actions).all(axis=-1)
+    valid_state = np.isfinite(poses).all(axis=-1) & np.isfinite(velocities).all(axis=-1)
+    valid_state &= np.linalg.norm(poses[..., 3:7], axis=-1) > 0
+    valid = valid_control & valid_state
+    ended = output.terminals.astype(bool) | ~valid
+    first = np.where(ended.any(axis=0), ended.argmax(axis=0), steps)
+    positions = np.linalg.norm(output.next_position_error, axis=-1)
+    results = []
+    for lane in range(lanes):
+        end = int(first[lane])
+        reason, success, n = "timeout", False, steps
+        if end < steps:
+            n = end + int(valid[end, lane])
+            if not valid_control[end, lane]:
+                reason = "nonfinite_control"
+            elif not valid_state[end, lane]:
+                reason = "nonfinite_state"
+            elif output.failure_terminals[end, lane]:
+                reason = "failure"
+            elif output.success_terminals[end, lane]:
+                reason, success = "success", True
+            else:
+                reason = "terminated"
+        row = dict(
+            success=success, completion_fraction=float(success),
+            completion_time=n * dt if success else None,
+            episode_length=n, termination_reason=reason,
+            episodic_return=float(output.rewards[:n, lane].sum()),
+            control_effort=float(np.abs(actions[:n, lane]).sum() * dt),
+        )
+        for name, values in (("position_error", positions[:n, lane]),
+                             ("attitude_error", output.next_attitude_error[:n, lane])):
+            row.update({f"mean_{name}": float(values.mean()) if n else None,
+                        f"max_{name}": float(values.max()) if n else None,
+                        f"final_{name}": float(values[-1]) if n else None})
+        results.append(dict(metrics=row, time=np.arange(n + 1) * dt,
+                            qpos=np.concatenate([initial_poses[lane:lane+1], poses[:n, lane]])))
+    return results

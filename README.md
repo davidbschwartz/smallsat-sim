@@ -655,6 +655,43 @@ reward, and effect extensions in one such collection run.
 
 ## Training and evaluation
 
+For paired, independently sampled scenarios, both PPO and SAC expose the same
+saved-policy API. Construct the runner with its saved training configuration and
+checkpoint directory, then call:
+
+```python
+import numpy as np
+
+scenarios = []
+for seed in range(10000, 10100):
+    rng = np.random.default_rng(seed)
+    pose = np.asarray(runner.reference_point[0]).copy()
+    pose[:3] += rng.uniform(-1.0, 1.0, 3)
+    scenarios.append(dict(
+        evaluation_seed=seed,
+        initial_qpos=pose, initial_qvel=np.zeros(6),
+        mass_scale=1.0, inertia_scale=1.0,
+        thrust_scale=np.ones(runner.env.act_dim), wrench=np.zeros(6),
+    ))
+
+episodes, timing = runner.evaluate(scenarios=scenarios, batch_size=128)
+```
+
+This restores inference weights without rewinding training optimizers, counters,
+or RNGs, and evaluates deterministic actions in parallel MJX
+lanes, including when training used `freeflyer`. Each supplied scenario produces
+exactly one result, in input order, containing `scenario`, `metrics`, `time`, and
+`qpos`. Metrics and recordings end at the first task termination, invalid
+transition, or horizon; padding lanes are discarded. `steps` optionally overrides
+`training.episode_len`. Scenarios specify the complete physical realization;
+training faults and randomization are not added. Linear initial velocity and the
+constant applied wrench use world coordinates; angular initial velocity uses the
+body frame. This interface currently supports a single free body with a shared
+pose reference. Reuse the same scenario list across policies for paired comparisons.
+Evaluation seeds identify supplied samples; they do not trigger additional sampling.
+Calling `runner.evaluate()` without scenarios retains the existing batch-summary
+behavior for compatibility.
+
 Use the [benchmark CLI](experiments/rl_benchmarking/benchmark.py) for named presets
 and seeded comparisons:
 

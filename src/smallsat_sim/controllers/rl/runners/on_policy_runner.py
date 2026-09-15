@@ -35,6 +35,7 @@ from .runner_utils import (
     model_fingerprint,
     update_module_from_checkpoint_state,
     _restore_optimizer,
+    _checked_state,
 )
 from .training_loop import learn_runner
 from smallsat_sim.envs.effects.scheduling import reset_and_randomize
@@ -96,6 +97,7 @@ class OnPolicyRunner:
             setattr(self, name, value)
         self.policy_epoch = self.adaptation_epoch = 0
         self.teacher_source = None
+        self.evaluation_checkpoint = None
         self._collectors = {}
         self._collector_modes = {}
         self.resolved_config = {
@@ -193,7 +195,28 @@ class OnPolicyRunner:
         return result
 
     def restore_for_evaluation(self, source):
-        self.restore('adaptation' if source == 'estimated' else 'policy')
+        """Load inference weights without rewinding optimizers, counters, or RNGs."""
+        if source not in ("zero", "privileged", "estimated"):
+            raise ValueError("Unknown context source")
+        path = (Path(self.evaluation_checkpoint) if self.evaluation_checkpoint is not None
+                else Path(self.ckpt_dir) / self._filename("policy"))
+        policy = load_trained_modules(path.parent, path.name)
+        if policy["metadata"]["config_id"] != self.config_id:
+            raise ValueError("Checkpoint configuration differs from this run")
+        actor_state = _checked_state(nnx.state(self.agent.actor), policy["actor_model"])
+        if source == "estimated":
+            if self.am is None:
+                raise ValueError("Estimated evaluation requires an adaptation module")
+            adaptation = load_trained_modules(path.parent, self._filename("adaptation"))
+            if adaptation["metadata"]["config_id"] != self.config_id:
+                raise ValueError("Checkpoint configuration differs from this run")
+            teacher = nnx.merge(nnx.graphdef(self.agent.actor), actor_state)
+            if adaptation["metadata"]["teacher_id"] != model_fingerprint(teacher):
+                raise ValueError("Adaptation checkpoint belongs to a different teacher policy")
+            am_state = _checked_state(nnx.state(self.am), adaptation["am_model"])
+        nnx.update(self.agent.actor, actor_state)
+        if source == "estimated":
+            nnx.update(self.am, am_state)
 
     def collect_state(self, collector, state, key):
         """Evaluate a caller-prepared scenario with this runner's collection contract."""

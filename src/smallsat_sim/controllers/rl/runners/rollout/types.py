@@ -101,6 +101,7 @@ class FunctionalRolloutResult:
     final_context: jnp.ndarray
     final_rng: jnp.ndarray
     final_policy_state: Any
+    trajectory: Any = None
 
 
 @dataclass
@@ -117,6 +118,7 @@ class _FunctionalRolloutStep:
     truncated_mask: jnp.ndarray
     bootstrap_value: jnp.ndarray
     labels: Any
+    trajectory: Any = None
 
 
 jax.tree_util.register_dataclass(_FunctionalRolloutStep)

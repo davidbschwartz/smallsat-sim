@@ -6,6 +6,7 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
+from experiments.demonstration_use_cases.common import evaluation_trial_count
 from experiments.demonstration_use_cases.common import (
     EXPERIMENTS,
     load_config,
@@ -205,13 +206,19 @@ def test_docking_short_execution(tmp_path):
     c = load_config("exp4_docking", mode="smoke")
     c["protocol"]["controller"] = "pd"
     c["protocol"].update(default_trials=1, sensitivity_trials=1, steps=2)
-    c["protocol"].update(dock_site="dock_ppe_port_a", initial_radius=[0.1, 0.2], initial_z_span=0.1)
+    c["protocol"].update(initial_radius=[0.1, 0.2], initial_z_span=0.1)
     job = jobs(c)[0]
     with run_directory(tmp_path, c, job) as run:
         docking(c, job, run)
     row = json.loads((run.path / "metrics.jsonl").read_text())
     assert row["episode_length"] == 2 and row["peak_contact_force"] >= 0
     assert (run.path / "traces/0000.json").exists()
+    contact_model = json.loads((run.path / "contact_model.json").read_text())
+    assert contact_model["site"] == "dock_crew_airlock_a"
+    np.testing.assert_allclose(contact_model["dock"], [-3.11, -7.12740877759179, -0.02])
+    np.testing.assert_allclose(
+        np.asarray(contact_model["pre_dock"]) - contact_model["dock"], [0.0, -1.0, 0.0]
+    )
     with np.load(run.path / "recordings/default/0000.npz") as recording:
         assert len(recording["time"]) == 3
         assert recording["time"][0] == 0.0
@@ -273,7 +280,7 @@ def test_complete_synthetic_campaign_and_missing_run(tmp_path):
                 )
                 count = p.get("trials", p.get("default_trials"))
                 for condition in conditions:
-                    for trial in range(count):
+                    for trial in range(count if experiment == "exp4_docking" else evaluation_trial_count(config, condition)):
                         row = {
                             **job,
                             "condition": condition,
@@ -323,7 +330,9 @@ def test_complete_synthetic_campaign_and_missing_run(tmp_path):
     manifest = aggregate(root, tmp_path / "artifacts", mode="smoke")
     assert not manifest["partial"]
     summary = pd.read_csv(tmp_path / "artifacts/data/exp3_summary.csv")
-    assert len(summary) == 6 * 5 and set(summary.n) == {2}
+    assert len(summary) == 6 * 5
+    assert set(summary.loc[summary.condition == "nominal", "n"]) == {1}
+    assert set(summary.loc[summary.condition != "nominal", "n"]) == {2}
     assert (tmp_path / "artifacts/paper/figures/exp4_contact_trajectory.pdf").exists()
     assert (tmp_path / "artifacts/paper/tables/exp3_robustness.tex").exists()
     for item in manifest["artifacts"]:
@@ -532,7 +541,7 @@ def test_resume_and_aggregation_share_training_validation(tmp_path, algorithm, d
     budget = hp.get("total_transitions", hp.get("epochs", 0) * hp.get("steps_per_epoch", 0) * count)
     with run_directory(tmp_path, config, job) as run:
         for condition in config["common"]["evaluation_distributions"]:
-            for trial in range(config["protocol"]["trials"]):
+            for trial in range(evaluation_trial_count(config, condition)):
                 run.append(dict(condition=condition,
                                 evaluation_seed=config["common"]["evaluation_seed_start"] + trial,
                                 success=False, final_position_error=1., final_attitude_error=1.,
@@ -586,3 +595,37 @@ def test_removed_training_evaluation_is_rejected():
         interval_transitions=10, trials=2, seed_start=30000)
     with pytest.raises(ValueError, match="no longer supported"):
         validate_config(config)
+
+
+def test_rl_suite_distinctness_pairing_and_single_fixed_probe():
+    config = load_config('exp3_rl_robustness', mode='paper')
+    common = config['common']
+    scenarios = {}
+    for condition, distribution in common['evaluation_distributions'].items():
+        count = evaluation_trial_count(config, condition)
+        scenarios[condition] = [sample_trial(common, common['evaluation_seed_start']+i, distribution, 12)
+                                for i in range(count)]
+        physical = [{k:s[k] for k in ('initial_qpos','initial_qvel','mass_scale','inertia_scale','thrust_scale','wrench')}
+                    for s in scenarios[condition]]
+        assert len({digest(s) for s in physical})==count
+    assert len(scenarios['nominal'])==1
+    assert sum(map(len, scenarios.values()))==401
+    for condition in ['thrust_variation','disturbance','combined']:
+        for nominal, perturbed in zip(scenarios['randomized_initial'], scenarios[condition], strict=True):
+            np.testing.assert_array_equal(nominal['initial_qpos'],perturbed['initial_qpos'])
+            np.testing.assert_array_equal(nominal['initial_qvel'],perturbed['initial_qvel'])
+
+
+@pytest.mark.parametrize('overrides', [{'nominal':0}, {'missing':1}, {'nominal':True}, []])
+def test_invalid_condition_counts_rejected(overrides):
+    from experiments.demonstration_use_cases.common import validate_config
+    config = load_config('exp3_rl_robustness', mode='smoke')
+    config['protocol']['evaluation_trials']=overrides
+    with pytest.raises(ValueError,match='evaluation_trials'):
+        validate_config(config)
+
+
+def test_historical_uniform_trial_counts_remain_valid():
+    config = load_config('exp3_rl_robustness', mode='paper')
+    config['protocol'].pop('evaluation_trials')
+    assert evaluation_trial_count(config,'nominal')==100
