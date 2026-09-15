@@ -1,47 +1,65 @@
-"""Thin adapters over SmallSatSim models, planners, controllers and RL runners."""
+"""Experiment runner setup and deterministic native evaluation.
+
+Training and control use SmallSatSim implementations. The evaluation loop owns
+paired scenario resets, fault onset, stopping criteria, and artifact recording.
+"""
 
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from time import perf_counter
+import os
 
+import jax.numpy as jnp
+from flax import nnx
 import mujoco
+import yaml
 import numpy as np
 
 from smallsat_sim.configuration import settings
+from smallsat_sim.controllers.pd.controller import PDController
+from smallsat_sim.controllers.rl.runners.factory import make_runner
+from smallsat_sim.envs.effects.classical import PerturbationStatus, ThrusterFailureSimulator
+from smallsat_sim.envs.vehicles.astrobee_rl.env import AstrobeeEnvVectorized
+from smallsat_sim.model.dynamics import SymbolicModel
+from smallsat_sim.planners.oracle.oracle_rl import OraclePlannerRL
 from smallsat_sim.controllers.nominal_mpc.reference import MPCSolverError
 from smallsat_sim.model.mujoco_xml import build_mujoco_xml
 from smallsat_sim.model.vehicle import load_vehicle
 
 from .common import plain
+from .effects import training_effects
+from .mjx_evaluation import evaluate_mjx
 from .replay import EpisodeRecording
 from .task import PoseMetrics, features, register_task, sample_trial
 
 
 def vehicle(config, name, directory):
-    import yaml
-
     path = Path(directory) / f"{name}_asset.yaml"
     path.write_text(yaml.safe_dump(config["assets"][name]))
     return load_vehicle(path)
 
 
 def build_runner(config, job, run):
-    from smallsat_sim.controllers.rl.runners.factory import make_runner
-    from smallsat_sim.envs.vehicles.astrobee_rl.env import AstrobeeEnvVectorized
-    from smallsat_sim.planners.oracle.oracle_rl import OraclePlannerRL
-
-    from .effects import training_effects
-
     register_task()
     common = deepcopy(config["common"])
     env_config = settings(common["env"])
     training_config = settings(common["training"])
     algorithm = job["controller"]
     training_config.algorithm = algorithm
+    if algorithm in config["protocol"].get("policy_hidden_sizes", {}):
+        training_config.policy_hidden_sizes = deepcopy(config["protocol"]["policy_hidden_sizes"][algorithm])
+    training_config.training_checkpoint_interval = config["protocol"].get(
+        "checkpoint_intervals", {}
+    ).get(algorithm, training_config.training_checkpoint_interval)
     training_config.checkpoint_dir = str((run.path / "checkpoint").resolve())
     env_config.sim.seed = job["seed"]
     env_config.model = job["spacecraft"]
-    env_config.environment.num_envs = job.get("batch_size", env_config.environment.num_envs)
+    env_config.environment.num_envs = job.get(
+        "batch_size", config["protocol"].get("training_num_envs", {}).get(
+            algorithm, env_config.environment.num_envs
+        )
+    )
     env_config.max_episode_len = training_config[algorithm.upper()].max_ep_len
     env_config.environment.train_with_failures = job.get("regime") == "randomized"
     env_config.environment.custom_faults = []
@@ -56,8 +74,14 @@ def build_runner(config, job, run):
         training_config.PPO.steps_per_epoch = steps
         training_config.PPO.max_ep_len = steps
         env_config.max_episode_len = steps
+    wandb_mode = config["protocol"].get("wandb_mode", "disabled")
+    if wandb_mode != "disabled":
+        directory = (run.path / "wandb").resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        os.environ["WANDB_MODE"] = wandb_mode
+        os.environ["WANDB_DIR"] = str(directory)
     args = SimpleNamespace(
-        headless=True, num_bodies=1, log=False, wandb=False, video=False, viewer=False
+        headless=True, num_bodies=1, log=False, wandb=wandb_mode != "disabled", video=False, viewer=False
     )
     asset = vehicle(config, job["spacecraft"], run.path)
     env = AstrobeeEnvVectorized(args=args, config=env_config, vehicle=asset, run_name=run.path.name)
@@ -65,8 +89,6 @@ def build_runner(config, job, run):
         planner = OraclePlannerRL(env, radius=0.0)
         runner = make_runner(env, planner, config=training_config)
         run.update(training_num_envs=env.num_envs)
-        import yaml
-
         (run.path / "runtime_config.yaml").write_text(
             yaml.safe_dump(plain({"env": env_config, "training": training_config}))
         )
@@ -138,18 +160,15 @@ class SetpointPlanner:
 
 def controller(env, planner, name):
     if name == "pd":
-        from smallsat_sim.controllers.pd.controller import PDController
-
         return PDController(env, planner)
     if name == "mpc":
+        # Keep the optional acados dependency local so PD/RL work without the MPC extra.
         try:
             from smallsat_sim.controllers.nominal_mpc.controller import NominalMPCController
         except ImportError as error:
             raise RuntimeError(
                 "MPC requires the repository mpc extra and native acados setup; see .setup/smallsat"
             ) from error
-        from smallsat_sim.model.dynamics import SymbolicModel
-
         env.symbolic_model = SymbolicModel(env.model_cfg)
         return NominalMPCController(env, planner)
     raise ValueError(f"Unknown classical controller {name}")
@@ -161,8 +180,6 @@ def fault_mapping(vehicle, condition, sample, common):
     max_thrust = vehicle.actuators[thruster_index].forcerange[1]
     fault = common["faults"]
     if condition in ("faulty_valve", "saturated_thrust", "thrust_instability"):
-        from smallsat_sim.envs.effects.classical import PerturbationStatus, ThrusterFailureSimulator
-
         sampler = ThrusterFailureSimulator(
             num_points=fault["num_points"],
             subset_size=fault["subset_size"],
@@ -197,15 +214,15 @@ def fault_mapping(vehicle, condition, sample, common):
 
 
 def evaluate(config, job, run, *, actor=None):
+    if actor is not None and config["protocol"].get("evaluation_backend") == "mjx":
+        return evaluate_mjx(config, job, run, actor)
+    evaluation_start = perf_counter()
     common, protocol = config["common"], config["protocol"]
     env = NativeEnvironment(config, job["spacecraft"], run)
     reference = np.asarray(common["reference"])
     planner = SetpointPlanner(reference)
     policy = None if actor else controller(env, planner, job["controller"])
     if actor:
-        import jax.numpy as jnp
-        from flax import nnx
-
         action = nnx.jit(lambda obs: actor.deterministic_action(obs))
     conditions = (
         [job["condition"]] if "condition" in job else list(common["evaluation_distributions"])
@@ -218,6 +235,7 @@ def evaluate(config, job, run, *, actor=None):
         if protocol["experiment"] == "exp2_fault_robustness" and condition == "nominal":
             distribution = {}
         for trial in range(protocol["trials"]):
+            trial_start = perf_counter()
             seed = common["evaluation_seed_start"] + trial
             sample = sample_trial(common, seed, distribution, env.model.nu)
             env.reset(sample)
@@ -290,6 +308,7 @@ def evaluate(config, job, run, *, actor=None):
                     )
                     else None,
                     fault_type=condition,
+                    evaluation_wall_seconds=perf_counter() - trial_start,
                     fault_severity={
                         "curve": condition
                         in ("faulty_valve", "saturated_thrust", "thrust_instability"),
@@ -303,3 +322,4 @@ def evaluate(config, job, run, *, actor=None):
                     **row,
                 )
             )
+    run.update(evaluation_wall_seconds=perf_counter() - evaluation_start)

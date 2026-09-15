@@ -52,6 +52,17 @@ def digest(value):
     return hashlib.sha256(json.dumps(plain(value), sort_keys=True).encode()).hexdigest()
 
 
+def _apply_overrides(base, overrides):
+    """Apply explicit experiment settings without mutating other experiments."""
+    for key, value in overrides.items():
+        if key not in base:
+            raise ValueError(f"Unknown common override: {key}")
+        if isinstance(value, dict) and isinstance(base[key], dict):
+            _apply_overrides(base[key], value)
+        else:
+            base[key] = deepcopy(value)
+
+
 def load_config(experiment, *, mode="development", path=None):
     if experiment not in EXPERIMENTS:
         raise ValueError(f"Unknown experiment: {experiment}")
@@ -62,6 +73,9 @@ def load_config(experiment, *, mode="development", path=None):
     else:
         common = yaml.safe_load((HERE / "configs/common.yaml").read_text())
         protocol = yaml.safe_load((HERE / "configs" / experiment / "paper.yaml").read_text())
+        _apply_overrides(common, protocol.get("common_overrides", {}))
+        if "evaluation_distributions" in protocol:
+            common["evaluation_distributions"] = deepcopy(protocol["evaluation_distributions"])
         assets = {
             name: yaml.safe_load((HERE / "configs/assets" / f"{name}.yaml").read_text())
             for name in ("astrobee", "cubesat", "sprint")
@@ -111,12 +125,32 @@ def _configure_smoke(config, experiment):
         )
     if experiment == "exp3_rl_robustness":
         protocol["seeds"] = [0]
+        protocol["training_num_envs"] = {key: 2 for key in protocol.get("training_num_envs", {})}
     if experiment == "exp4_docking":
         protocol.update(default_trials=2, sensitivity_trials=2, steps=8)
 
 
 def validate_config(config):
     common, protocol = config["common"], config["protocol"]
+    if "sac_training_evaluation" in protocol:
+        raise ValueError("sac_training_evaluation is no longer supported")
+    for sizes in protocol.get("policy_hidden_sizes", {}).values():
+        if not isinstance(sizes, list) or not sizes or any(
+            isinstance(size, bool) or not isinstance(size, int) or size < 1 for size in sizes
+        ):
+            raise ValueError("policy_hidden_sizes must contain nonempty lists of positive integers")
+    if "sac_curriculum" in protocol:
+        raise ValueError("sac_curriculum is no longer supported; use a configuration without curriculum")
+    if protocol.get("evaluation_backend", "mujoco_native") not in ("mjx", "mujoco_native"):
+        raise ValueError("evaluation_backend must be mjx or mujoco_native")
+    if protocol.get("wandb_mode", "disabled") not in ("disabled", "offline", "online"):
+        raise ValueError("wandb_mode must be disabled, offline or online")
+    for interval in protocol.get("checkpoint_intervals", {}).values():
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            raise ValueError("checkpoint_intervals must contain positive integers")
+    for count in protocol.get("training_num_envs", {}).values():
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError("training_num_envs must contain positive integers")
     if (
         common["schema_version"] != 1
         or common["success_id"] != "demonstration_use_cases/full_pose/v1"
@@ -132,7 +166,9 @@ def validate_config(config):
         "default_trials",
         "sensitivity_trials",
     ):
-        if key in protocol and (not isinstance(protocol[key], int) or protocol[key] < 1):
+        if key in protocol and (
+            isinstance(protocol[key], bool) or not isinstance(protocol[key], int) or protocol[key] < 1
+        ):
             raise ValueError(f"{key} must be a positive integer")
     for key in ("batch_sizes", "seeds", "conditions", "controllers", "algorithms", "regimes"):
         if key in protocol and (not protocol[key] or len(set(protocol[key])) != len(protocol[key])):
@@ -155,6 +191,8 @@ def parser(experiment):
     modes.add_argument("--paper", action="store_true")
     result.add_argument("--config", type=Path, help="Full resolved YAML, development mode only")
     result.add_argument("--output", type=Path, default=Path("results/demonstration_use_cases"))
+    result.add_argument("--job-id", action="append", help="Run only these exact --plan job identities")
+    result.add_argument("--resume", action="store_true", help="Skip validated completed jobs; retain failed attempts")
     result.add_argument(
         "--plan", action="store_true", help="Print required jobs without simulation"
     )
@@ -355,10 +393,17 @@ def run_directory(root, config, job):
 def execute(experiment, args, handler):
     config = load_config(experiment, mode=mode_of(args), path=args.config)
     selected = jobs(config)
+    requested = getattr(args, "job_id", None)
+    if requested:
+        unknown = set(requested) - {job_id(job) for job in selected}
+        if unknown:
+            raise ValueError(f"Unknown job identities: {sorted(unknown)}")
+        selected = [job for job in selected if job_id(job) in requested]
     if args.plan:
         print(
             json.dumps(
-                {"mode": config["mode"], "config_id": digest(config), "jobs": selected}, indent=2
+                {"mode": config["mode"], "config_id": digest(config), "jobs": selected,
+                 "job_ids": [job_id(job) for job in selected]}, indent=2
             )
         )
         return
@@ -366,6 +411,9 @@ def execute(experiment, args, handler):
     for job in selected:
         print(f"{experiment}: {job_id(job)}", flush=True)
         try:
+            if getattr(args, "resume", False) and completed_job(args.output, config, job):
+                print("Validated completed job; skipping", flush=True)
+                continue
             with run_directory(args.output, config, job) as run:
                 handler(config, job, run)
         except Exception as error:
@@ -375,3 +423,28 @@ def execute(experiment, args, handler):
         raise RuntimeError(
             "Some jobs failed; all other requested jobs were attempted:\n" + "\n".join(failures)
         )
+
+
+def completed_job(root, config, job):
+    """Never select a favorable repeat or resume a different protocol."""
+    from .aggregate import records, validate_run_records
+
+    directory = Path(root) / config["mode"] / config["protocol"]["experiment"]
+    completed = []
+    for path in directory.glob("*/metadata.json"):
+        meta = json.loads(path.read_text())
+        if meta["job_id"] != job_id(job):
+            continue
+        if meta["status"] == "running":
+            raise ValueError(f"Job already marked running: {path.parent}")
+        if meta["status"] != "complete":
+            continue
+        resolved = yaml.safe_load((path.parent / "resolved_config.yaml").read_text())
+        if digest(resolved) != digest(config) or meta["config_id"] != digest(config):
+            raise ValueError(f"Completed job has a different configuration: {path.parent}")
+        rows = records(path.parent / "metrics.jsonl")
+        validate_run_records(path.parent, config, meta, rows)
+        completed.append(path.parent)
+    if len(completed) > 1:
+        raise ValueError(f"Duplicate completed job {job_id(job)}")
+    return bool(completed)

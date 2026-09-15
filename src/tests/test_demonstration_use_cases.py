@@ -35,23 +35,25 @@ def test_configs_load_and_smoke_is_separate(experiment):
     assert load_config(experiment, mode="paper") == paper
 
 
-def test_equal_training_budget_and_ood_support():
-    c = load_config("exp3_rl_robustness")["common"]
+def test_equal_training_budget_and_moderate_robustness_support():
+    config = load_config("exp3_rl_robustness")
+    c = config["common"]
     t = c["training"]
     n = c["env"]["environment"]["num_envs"]
+    assert n == config["protocol"]["training_num_envs"]["sac"] == 4096
     assert (
         t["PPO"]["steps_per_epoch"] * t["PPO"]["epochs"] * n
         == t["VPG"]["steps_per_epoch"] * t["VPG"]["epochs"] * n
         == t["SAC"]["total_transitions"]
     )
-    assert (
-        c["evaluation_distributions"]["ood_thrust"]["thrust"][1]
-        < c["train_distribution"]["thrust"][0]
-    )
-    assert (
-        c["evaluation_distributions"]["ood_mass_inertia"]["mass"][0]
-        > c["train_distribution"]["mass"][1]
-    )
+    assert set(c['evaluation_distributions']) == {
+        'nominal', 'randomized_initial', 'thrust_variation', 'disturbance', 'combined'}
+    assert c['train_distribution']['thrust'] == [0.9, 1.1]
+    for distribution in c['evaluation_distributions'].values():
+        assert distribution.get('mass', [1., 1.]) == [1., 1.]
+        assert distribution.get('inertia', [1., 1.]) == [1., 1.]
+        assert distribution.get('force', 0.) <= 0.005
+        assert distribution.get('torque', 0.) <= 0.0005
 
 
 def test_run_directories_and_failure_retention(tmp_path):
@@ -321,7 +323,7 @@ def test_complete_synthetic_campaign_and_missing_run(tmp_path):
     manifest = aggregate(root, tmp_path / "artifacts", mode="smoke")
     assert not manifest["partial"]
     summary = pd.read_csv(tmp_path / "artifacts/data/exp3_summary.csv")
-    assert len(summary) == 6 * 7 and set(summary.n) == {2}
+    assert len(summary) == 6 * 5 and set(summary.n) == {2}
     assert (tmp_path / "artifacts/paper/figures/exp4_contact_trajectory.pdf").exists()
     assert (tmp_path / "artifacts/paper/tables/exp3_robustness.tex").exists()
     for item in manifest["artifacts"]:
@@ -435,3 +437,152 @@ def test_rl_demonstration_training_matrix():
         for regime in ("nominal", "randomized")
         for seed in range(5)
     }
+
+
+def test_experiment_overrides_are_explicit_and_reject_typos():
+    from experiments.demonstration_use_cases.common import _apply_overrides
+    base = {'training': {'PPO': {'epochs': 80}}, 'episode_steps': 512}
+    _apply_overrides(base, {'training': {'PPO': {'epochs': 320}}})
+    assert base == {'training': {'PPO': {'epochs': 320}}, 'episode_steps': 512}
+    with pytest.raises(ValueError, match='Unknown common override'):
+        _apply_overrides(base, {'training': {'PPO': {'epochz': 320}}})
+
+
+def test_resume_validates_complete_jobs_and_rejects_duplicates(tmp_path):
+    from experiments.demonstration_use_cases.common import completed_job
+    from copy import deepcopy
+    config = load_config('spacecraft_portability', mode='smoke')
+    job = jobs(config)[0]
+    def complete():
+        with run_directory(tmp_path, config, job) as run:
+            for trial in range(config['protocol']['trials']):
+                run.append(dict(condition=job['condition'], evaluation_seed=10000 + trial,
+                                success=False, final_position_error=1., final_attitude_error=1.,
+                                control_effort=0., termination_reason='timeout'))
+    assert not completed_job(tmp_path, config, job)
+    complete()
+    assert completed_job(tmp_path, config, job)
+    changed = deepcopy(config)
+    changed['common']['episode_steps'] += 1
+    with pytest.raises(ValueError, match='different configuration'):
+        completed_job(tmp_path, changed, job)
+    complete()
+    with pytest.raises(ValueError, match='Duplicate completed job'):
+        completed_job(tmp_path, config, job)
+
+
+def test_resume_rejects_active_job_and_smoke_limits_algorithm_batches(tmp_path):
+    from experiments.demonstration_use_cases.common import completed_job
+    config = load_config('exp3_rl_robustness', mode='smoke')
+    assert config['protocol']['training_num_envs']['sac'] == 2
+    job = jobs(config)[0]
+    Run(tmp_path, config, job)
+    with pytest.raises(ValueError, match='already marked running'):
+        completed_job(tmp_path, config, job)
+
+
+def test_isolated_rl_worker_metadata_survives_parent_commit(tmp_path, monkeypatch):
+    from experiments.demonstration_use_cases import exp3_rl_robustness as experiment
+    config = load_config('exp3_rl_robustness', mode='smoke')
+    job = jobs(config)[0]
+    def worker(command, **kwargs):
+        path = Path(command[-1]) / 'metadata.json'
+        meta = json.loads(path.read_text())
+        meta.update(checkpoint_path='checkpoint/actor', evaluation_backend='mjx',
+                    evaluation_wall_seconds=1.25)
+        write_json(path, meta)
+        return SimpleNamespace(returncode=0)
+    with run_directory(tmp_path, config, job) as run:
+        monkeypatch.setattr(experiment.subprocess, 'run', worker)
+        experiment.isolated_training(config, job, run)
+    meta = json.loads((run.path / 'metadata.json').read_text())
+    assert meta['status'] == 'complete'
+    assert meta['checkpoint_path'] == 'checkpoint/actor'
+    assert meta['evaluation_backend'] == 'mjx'
+    assert meta['evaluation_wall_seconds'] == 1.25
+
+
+def test_training_health_distinguishes_numerics_from_performance():
+    from experiments.demonstration_use_cases.aggregate import training_health
+    base = dict(run_id='run', controller='sac', regime='nominal', training_seed=0,
+                completed_episode_count=0, success_termination_step_count=0,
+                mean_lateral_error=2., mean_angle_error=100., mean_episodic_returns=-1.)
+    rows = [dict(base, environment_steps=i+1, epoch_seconds=1.) for i in range(20)]
+    rows[-2].update(completed_episode_count=1, success_termination_step_count=1)
+    rows[-1].update(completed_episode_count=9, success_termination_step_count=0)
+    health = training_health(rows).iloc[0]
+    assert health.numerical_health_ok
+    assert health.late_success_rate == pytest.approx(.1)  # Not the .5 mean of update rates.
+    assert pd.isna(health.early_success_rate)  # No completed episodes is not zero success.
+    rows[-1]['epoch_seconds'] = None
+    assert not training_health(rows).iloc[0].numerical_health_ok
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "sac"])
+@pytest.mark.parametrize("defect", [None, "checkpoint", "budget", "axis", "training"])
+def test_resume_and_aggregation_share_training_validation(tmp_path, algorithm, defect):
+    from experiments.demonstration_use_cases.common import completed_job
+
+    config = load_config("exp3_rl_robustness", mode="smoke")
+    job = next(job for job in jobs(config)
+               if job["controller"] == algorithm and job["regime"] == "nominal")
+    hp = config["common"]["training"][algorithm.upper()]
+    count = config["protocol"].get("training_num_envs", {}).get(
+        algorithm, config["common"]["env"]["environment"]["num_envs"])
+    budget = hp.get("total_transitions", hp.get("epochs", 0) * hp.get("steps_per_epoch", 0) * count)
+    with run_directory(tmp_path, config, job) as run:
+        for condition in config["common"]["evaluation_distributions"]:
+            for trial in range(config["protocol"]["trials"]):
+                run.append(dict(condition=condition,
+                                evaluation_seed=config["common"]["evaluation_seed_start"] + trial,
+                                success=False, final_position_error=1., final_attitude_error=1.,
+                                control_effort=0., termination_reason="timeout"))
+        run.update(checkpoint_path="actor.ckpt")
+        if defect != "checkpoint":
+            (run.path / "actor.ckpt").mkdir()
+        if defect != "training":
+            axis = [budget, budget] if defect == "axis" else [budget - 1 if defect == "budget" else budget]
+            for step in axis:
+                run.append(dict(environment_steps=step), "training.jsonl")
+    accepted, errors, _ = discover(tmp_path, "smoke", allow_partial=True)
+    if defect is None:
+        assert completed_job(tmp_path, config, job)
+        assert len(accepted) == 1
+    else:
+        with pytest.raises(ValueError, match="missing checkpoint, incomplete budget"):
+            completed_job(tmp_path, config, job)
+        assert not accepted
+        assert any("missing checkpoint, incomplete budget" in error for error in errors)
+
+
+def test_removed_curriculum_is_rejected_including_smoke():
+    from experiments.demonstration_use_cases.common import validate_config, _configure_smoke
+
+    config = load_config("exp3_rl_robustness", mode="development")
+    config["protocol"]["sac_curriculum"] = [{"from_transition": 0, "scale": 1.0}]
+    for smoke in (False, True):
+        if smoke:
+            _configure_smoke(config, "exp3_rl_robustness")
+        with pytest.raises(ValueError, match="no longer supported"):
+            validate_config(config)
+
+
+@pytest.mark.parametrize("key", ["checkpoint_intervals", "training_num_envs", "trials"])
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5])
+def test_protocol_integer_settings_reject_invalid_values(key, value):
+    from experiments.demonstration_use_cases.common import validate_config
+
+    config = load_config("exp3_rl_robustness", mode="development")
+    config["protocol"][key] = value if key == "trials" else {"sac": value}
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_config(config)
+
+
+def test_removed_training_evaluation_is_rejected():
+    from experiments.demonstration_use_cases.common import validate_config
+
+    config = load_config("exp3_rl_robustness", mode="development")
+    config["protocol"]["sac_training_evaluation"] = dict(
+        interval_transitions=10, trials=2, seed_start=30000)
+    with pytest.raises(ValueError, match="no longer supported"):
+        validate_config(config)

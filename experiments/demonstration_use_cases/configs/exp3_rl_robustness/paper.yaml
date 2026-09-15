@@ -1,4 +1,58 @@
 experiment: exp3_rl_robustness
+evaluation_backend: mjx
+# SAC counts short collection chunks as updates; avoid rewriting its full replay
+# buffer every ten chunks. Both algorithms also save at the end of training.
+checkpoint_intervals:
+  ppo: 100
+  sac: 10000
+policy_hidden_sizes:
+  sac: [256, 256]
+# Both algorithms train on the full starting distribution without curriculum.
+# Keep 320 PPO updates at the requested 4,096-way training batch.
+# Equal transition budgets: 4096 * 512 * 320 = 671,088,640.
+common_overrides:
+  train_distribution:
+    thrust: [0.9, 1.1]
+    force: 0.005
+    torque: 0.0005
+  env:
+    environment:
+      num_envs: 4096
+  training:
+    PPO:
+      epochs: 320
+      actor_training_epochs: 10
+      critic_training_epochs: 5
+      target_kl: 0.01
+    VPG:
+      epochs: 320
+    SAC:
+      total_transitions: 671088640
+      randomization_pool_size: 4096
+      replay_capacity: 8388608
+      learning_starts: 2097152
+      batch_size: 4096
+      gamma: 0.999
+      initial_alpha: 0.001
+      alpha_lr: 0.00003
+      target_entropy: -36.0
+training_num_envs:
+  sac: 4096
+# Main demonstration: modest actuator uncertainty and external wrenches.
+# Mass/inertia remain nominal; severe/combined dynamics shifts are separate studies.
+evaluation_distributions:
+  nominal:
+    initial: fixed
+  randomized_initial: {}
+  thrust_variation:
+    thrust: [0.9, 1.1]
+  disturbance:
+    force: 0.005
+    torque: 0.0005
+  combined:
+    thrust: [0.9, 1.1]
+    force: 0.005
+    torque: 0.0005
 algorithms:
 - ppo
 - sac

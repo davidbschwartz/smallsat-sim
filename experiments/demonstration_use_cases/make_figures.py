@@ -178,6 +178,26 @@ def make_figures(data, output, *, label=None):
                         )
                         ax.set_ylim(0, 1.05)
             save(fig, title, exp)
+            if prefix == "exp3":
+                fig, axes = plt.subplots(1, 3, figsize=(10, 3.5))
+                for ax, metric, label in zip(axes,
+                        ("final_position_error", "final_attitude_error", "control_effort"),
+                        ("Position error at termination [m]", "Attitude error at termination [rad]",
+                         "Command impulse [N s]")):
+                    for method in methods:
+                        rows = frame[frame.method == method].set_index("condition").reindex(conditions)
+                        median = rows[metric + "_median"]
+                        ax.errorbar(np.arange(len(conditions)), median,
+                            yerr=np.maximum(0, np.array([median - rows[metric + "_q25"],
+                                                       rows[metric + "_q75"] - median])),
+                            marker=".", linewidth=0.8, capsize=2, label=method)
+                    ax.set_xticks(np.arange(len(conditions)),
+                                  [c.replace("_", "\n") for c in conditions], rotation=25)
+                    ax.set_ylabel(label)
+                    ax.grid(alpha=0.2)
+                axes[0].legend(fontsize=6)
+                fig.suptitle("Continuous performance: median and interquartile range")
+                save(fig, "exp3_continuous_performance", exp)
             if prefix == "exp4":
                 fig, ax = plt.subplots(figsize=(3.5, 2.5))
                 ax.errorbar(
@@ -193,6 +213,7 @@ def make_figures(data, output, *, label=None):
         path = data / "exp3_learning_summary.csv"
         if path.exists():
             frame = pd.read_csv(path)
+            diagnostics = frame.copy()
             frame = frame[frame.metric == "mean_episodic_returns"]
             algorithms = list(frame.controller.unique())
             fig, axes = plt.subplots(
@@ -212,6 +233,33 @@ def make_figures(data, output, *, label=None):
             axes[0].set_ylabel("Episode return (mean ± SD)")
             axes[-1].legend()
             save(fig, "exp3_learning_curves", "exp3_rl_robustness")
+            for algorithm in algorithms:
+                metrics = ["success_rate", "mean_lateral_error", "mean_angle_error",
+                           "critic_loss_mean"] + (
+                               ["true_kl_mean", "explained_variance"] if algorithm == "ppo"
+                               else ["alpha", "entropy"])
+                labels = ["Reported training success", "Mean position error [m]",
+                          "Mean attitude error [degrees]", "Critic loss"] + (
+                              ["Policy KL", "Value explained variance"] if algorithm == "ppo"
+                              else ["Entropy temperature", "Policy entropy"])
+                fig, axes = plt.subplots(2, 3, figsize=(10, 5.5))
+                for ax, metric, label in zip(axes.flat, metrics, labels):
+                    for regime, style in [("nominal", "-"), ("randomized", "--")]:
+                        rows = diagnostics[(diagnostics.controller == algorithm)
+                                           & (diagnostics.regime == regime)
+                                           & (diagnostics.metric == metric)]
+                        if rows.empty:
+                            continue
+                        x, y = rows.environment_steps.to_numpy(), rows["mean"].to_numpy()
+                        std = rows["std"].fillna(0).to_numpy()
+                        ax.plot(x, y, style, label=regime)
+                        ax.fill_between(x, y - std, y + std, alpha=0.15)
+                    ax.set(ylabel=label, xlabel="Environment steps")
+                    ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+                    ax.grid(alpha=0.2)
+                axes.flat[0].legend()
+                fig.suptitle(f"{algorithm.upper()} training diagnostics (mean ± seed SD)")
+                save(fig, f"exp3_{algorithm}_training_diagnostics", "exp3_rl_robustness")
         path = data / "exp4_representative.csv"
         if path.exists():
             frame = pd.read_csv(path)

@@ -105,14 +105,7 @@ def make_tables(data, output):
         path.write_text(tabular(headers, rows))
         artifacts.append((path, exp))
         if prefix == "exp3":
-            conditions = [
-                "nominal",
-                "id",
-                "ood_mass_inertia",
-                "ood_thrust",
-                "disturbance",
-                "compound",
-            ]
+            conditions = list(frame.condition.unique())
             compact = []
             for (algorithm, regime), group in frame.groupby(["controller", "regime"]):
                 by_condition = group.set_index("condition")
@@ -133,16 +126,7 @@ def make_tables(data, output):
             path.write_text(
                 "% Success proportions; uncertainty and episode counts are in the full table.\n"
                 + tabular(
-                    [
-                        "Method",
-                        "Seeds",
-                        "Nominal",
-                        "ID",
-                        "OOD M/I",
-                        "OOD thrust",
-                        "Wrench",
-                        "Compound",
-                    ],
+                    ["Method", "Seeds", *[escape(c.replace("_", " ")) for c in conditions]],
                     compact,
                 )
             )

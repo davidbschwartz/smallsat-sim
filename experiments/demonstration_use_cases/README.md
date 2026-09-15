@@ -5,15 +5,9 @@ reinforcement-learning robustness, Gateway contact, and spacecraft portability.
 The suite records reproducible run configurations and generates figures and tables
 from retained raw data. Experiment settings and run matrices are in `configs/`.
 
-## Validation status
-
-The `--paper` flag selects the checked-in evaluation configurations. Full
-campaigns and GPU measurements have not been completed. The current presets use
-mass-scaled CubeSat PD gains and a reachable exterior-port docking approach with
-a rate-limited reference. Docking measures a local approach and compliant contact;
+`--paper` selects the checked-in evaluation protocol; it does not certify that
+a campaign has completed. Docking measures a local approach and compliant contact;
 it does not establish hardware docking performance.
-
-Use separate output directories when rerunning revised configurations.
 
 ## Installation and execution
 
@@ -24,7 +18,7 @@ on Linux; on macOS, `uv sync --locked --extra mpc --extra paper` followed by
 `bash .setup/native/install_mpc.sh`). Source `.setup/env.sh` when running Python
 directly. Use the checked-in `uv.lock`.
 Matplotlib is required for artifact generation and is included in the `paper`
-extra. Rendering and W&B are disabled.
+extra. Rendering and W&B are disabled by default.
 
 ```bash
 python -m experiments.demonstration_use_cases.exp1_scaling --paper
@@ -55,12 +49,70 @@ python -m experiments.demonstration_use_cases.aggregate --mode smoke --allow-par
 
 Allow seconds to minutes for smoke checks and potentially hours to days for
 full campaigns, depending on hardware. These are planning estimates, not measured
-runtime guarantees. The learning campaign includes 20 training runs and 14,000
+runtime guarantees. The learning campaign includes 20 training runs and 10,000
 learned-policy evaluation episodes: PPO and SAC, each trained nominally and with
 randomization on seeds 0–4. PD and MPC remain evaluation baselines. All requested jobs are attempted and failures
 are reported, so a missing prerequisite does not discard other
 methods' results. GPU OOMs have explicit records; unexplained worker termination
 is a failure, not an inferred OOM.
+
+Both algorithms train with 4,096 parallel environments. PPO retains 320 updates
+of 512 control steps per environment (671,088,640 transitions); SAC has the same
+transition budget. Smoke runs use two environments.
+SAC uses separate 256-by-256 networks via `protocol.policy_hidden_sizes`; PPO
+retains its existing 64-by-64 networks.
+
+Learned-policy evaluation uses batched MJX: all trials for a condition advance
+together, with deterministic actions and no episode resets. Training retains its
+configured backend (currently `freeflyer`). Classical PD/MPC baselines and contact
+experiments use native MuJoCo. A development config can set
+`protocol.evaluation_backend: mujoco_native` for cross-backend checks. Both learned
+evaluation paths use identical sampled scenarios, pose metrics, first-episode
+termination, and recording formats. Timings are retained in run metadata;
+MJX batch timings include preparation and compilation.
+
+The main RL demonstration compares fixed nominal and randomized starting poses,
+±10% thrust variation, bounded world-frame disturbances (±0.005 N per force axis,
+±0.0005 N m per torque axis), and their combination. Randomized training uses
+these same bounds. Mass and inertia stay fixed.
+The fixed nominal condition repeats the same deterministic starting state; its
+trial count is not a count of independent scenarios. Use `randomized_initial`
+to assess nominal-dynamics reliability across starting poses, rather than
+pooling the repeated fixed probe into an overall success rate.
+This is a demonstration of a usable robust-control workflow, not a claim to solve
+all actuator failures or large model mismatch.
+
+Interpret success rates alongside continuous position/attitude errors and command
+impulse. `exp3_continuous_performance` plots medians and interquartile ranges;
+the full tables also report trajectory-mean errors. Final errors are measured at
+episode termination (success or deadline), not at a common fixed time. Failed
+episodes remain in these summaries. Changing the task tolerance to make a policy
+pass is not part of tuning.
+
+Aggregation writes `exp3_training_health.csv` with finite-value checks and early/late
+training summaries. Window success rates are weighted by completed episode counts;
+a window with no completed episodes has no success estimate. Numerical health
+alone does not establish controller quality. Inspect the PPO/SAC diagnostic plots
+alongside held-out performance, including position and attitude errors, losses,
+PPO KL and explained variance, and SAC entropy and temperature.
+Training errors average rollout states, including new randomized starts after
+automatic resets. They need not approach zero when episodes succeed quickly;
+use the separate held-out final-error summaries to assess terminal accuracy.
+
+Optional W&B logging and replay diagnostics are documented
+in [SAC tuning](TUNING.md).
+
+The PPO/SAC comparison matches task rewards, initial-state distributions,
+environment transitions, parallel environment count, and evaluation criteria.
+It compares tuned controllers: SAC uses 256-by-256 networks and discount 0.999,
+whereas PPO uses 64-by-64 networks and discount 0.995. Compute and tuning effort
+are not matched. Report wall time alongside success and continuous errors, and
+use the same held-out evaluation seeds for the multi-seed comparison.
+
+Use `--plan` to obtain exact `job_ids`, then repeat `--job-id ID` to select jobs.
+`--resume` skips validated completed jobs, rejects duplicate or mismatched runs,
+and retains failed attempts. It refuses to start another attempt for a job still
+marked running. `reproduce_all --resume --paper` applies this to the full campaign.
 
 ## Configurations and raw data
 
@@ -68,6 +120,8 @@ is a failure, not an inferred OOM.
 controller settings. `configs/assets/` freezes the physical spacecraft definitions.
 Per-experiment `paper.yaml` files define the run matrix. They are loaded directly,
 without resolving runtime parameters through mutable package defaults.
+`common_overrides` changes only that experiment's common settings;
+`evaluation_distributions` replaces its evaluation matrix explicitly.
 
 Raw runs go to `results/demonstration_use_cases/{paper,smoke,development}/<experiment>/`.
 Each attempt has its job identity, config hash and unique suffix. It includes:

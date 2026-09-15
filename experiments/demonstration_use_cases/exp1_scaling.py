@@ -1,6 +1,7 @@
 """Synchronized steady-state policy rollouts; one isolated process per batch size."""
 
 import subprocess
+import json
 import sys
 import time
 
@@ -77,6 +78,7 @@ def isolated(config, job, run):
             stdout=log,
             stderr=subprocess.STDOUT,
         )
+    run.meta = json.loads((run.path / "metadata.json").read_text())
     if result.returncode:
         message = (run.path / "worker.log").read_text()
         if any(

@@ -167,7 +167,11 @@ class OffPolicyRunner:
                 metrics.update(jax.tree.map(lambda *x: jnp.mean(jnp.stack(x)), *updates))
             metrics.update(environment_transitions=self.transitions, gradient_updates=self.gradient_updates,
                            replay_size=self.replay.size,
-                           updates_per_transition=hp.updates_per_collection / chunk)
+                           replay_history_steps=self.replay.size / self.env.num_envs,
+                           updates_per_transition=hp.updates_per_collection / chunk,
+                           replay_samples_per_transition=(
+                               hp.updates_per_collection * hp.batch_size / chunk
+                               if self.transitions >= hp.learning_starts else 0.0))
             jax.block_until_ready(metrics)
             metrics['epoch_seconds'] = time.perf_counter() - start
             report(self, 'policy_training', self.policy_epoch, metrics)

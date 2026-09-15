@@ -79,6 +79,37 @@ def validate_rows(config, job, rows):
                 raise ValueError(f"Missing trial fields: {required - row.keys()}")
 
 
+def validate_run_records(directory, config, meta, rows):
+    """Apply the same completed-run checks during aggregation and resume."""
+    validate_rows(config, meta["job"], rows)
+    if (
+        config["protocol"]["experiment"] != "exp3_rl_robustness"
+        or meta["job"].get("regime") == "baseline"
+    ):
+        return
+    training = records(directory / "training.jsonl")
+    algorithm = meta["job"]["controller"]
+    settings = config["common"]["training"][algorithm.upper()]
+    count = config["protocol"].get("training_num_envs", {}).get(
+        algorithm, config["common"]["env"]["environment"]["num_envs"]
+    )
+    budget = settings.get(
+        "total_transitions", settings.get("epochs", 0) * settings.get("steps_per_epoch", 0) * count
+    )
+    axis = [row["environment_steps"] for row in training]
+    checkpoint = meta.get("checkpoint_path")
+    if (
+        not axis
+        or axis[-1] != budget
+        or any(b <= a for a, b in zip([0] + axis, axis))
+        or not checkpoint
+        or not (directory / checkpoint).exists()
+    ):
+        raise ValueError(
+            f"{directory}: missing checkpoint, incomplete budget or invalid training step axis"
+        )
+
+
 def discover(root, mode, allow_partial=False):
     accepted = []
     errors = []
@@ -107,37 +138,12 @@ def discover(root, mode, allow_partial=False):
             raise ValueError(f"Mixed configs for {exp}; use separate campaign roots")
         rows = records(path.parent / "metrics.jsonl")
         try:
-            validate_rows(config, meta["job"], rows)
+            validate_run_records(path.parent, config, meta, rows)
         except ValueError as error:
             if not allow_partial:
                 raise
             errors.append(str(error))
             continue
-        if exp == "exp3_rl_robustness" and meta["job"].get("regime") != "baseline":
-            training = records(path.parent / "training.jsonl")
-            training_config = config["common"]["training"][meta["job"]["controller"].upper()]
-            budget = training_config.get(
-                "total_transitions",
-                training_config.get("epochs", 0)
-                * training_config.get("steps_per_epoch", 0)
-                * config["common"]["env"]["environment"]["num_envs"],
-            )
-            axis = [row["environment_steps"] for row in training]
-            checkpoint = meta.get("checkpoint_path")
-            if (
-                not axis
-                or axis[-1] != budget
-                or any(b <= a for a, b in zip([0] + axis, axis))
-                or not checkpoint
-                or not (path.parent / checkpoint).exists()
-            ):
-                error = (
-                    f"{path}: missing checkpoint, incomplete budget or invalid training step axis"
-                )
-                if not allow_partial:
-                    raise ValueError(error)
-                errors.append(error)
-                continue
         configs[exp] = config
         seen.add(identity)
         accepted.append((path.parent, meta, rows))
@@ -216,8 +222,10 @@ def learning_curves(frame):
         high = min(g.environment_steps.max() for g in curves)
         grid = np.unique(np.concatenate([g.environment_steps.to_numpy() for g in curves]))
         grid = grid[(grid >= low) & (grid <= high)]
-        for metric in ("mean_episodic_returns", "success_rate"):
-            if metric not in group:
+        for metric in ("mean_episodic_returns", "success_rate", "mean_lateral_error",
+                       "mean_angle_error", "critic_loss_mean", "actor_loss_mean",
+                       "true_kl_mean", "clip_fraction", "explained_variance", "alpha", "entropy"):
+            if metric not in group or not group[metric].notna().any():
                 continue
             values = np.stack([np.interp(grid, g.environment_steps, g[metric]) for g in curves])
             for index, step in enumerate(grid):
@@ -233,6 +241,38 @@ def learning_curves(frame):
                     )
                 )
     return pd.DataFrame(rows)
+
+
+def training_health(records):
+    """Report numerical health and episode-weighted convergence, not a quality claim."""
+    grouped = defaultdict(list)
+    for row in records:
+        grouped[row["run_id"]].append(row)
+    output = []
+    fields = ("epoch_seconds", "mean_reward", "mean_lateral_error", "mean_angle_error",
+              "mean_episodic_returns", "success_rate", "actor_loss_mean", "critic_loss_mean",
+              "true_kl_mean", "explained_variance", "clip_fraction", "alpha", "entropy")
+    for run_id, rows in grouped.items():
+        rows.sort(key=lambda row: row["environment_steps"])
+        first = rows[0]
+        width = max(1, len(rows) // 10)
+        row = dict(run_id=run_id, controller=first["controller"], regime=first["regime"],
+                   training_seed=first["training_seed"], updates=len(rows),
+                   environment_steps=rows[-1]["environment_steps"])
+        invalid = sum(1 for update in rows for field in fields if field in update
+                      and (update[field] is None or not np.isfinite(update[field])))
+        row.update(nonfinite_diagnostics=invalid, numerical_health_ok=invalid == 0)
+        for label, window in (("early", rows[:width]), ("late", rows[-width:])):
+            completed = sum(update.get("completed_episode_count", 0) for update in window)
+            successes = sum(update.get("success_termination_step_count", 0) for update in window)
+            row[label + "_completed_episodes"] = completed
+            row[label + "_success_rate"] = successes / completed if completed else None
+            for metric in ("mean_lateral_error", "mean_angle_error", "mean_episodic_returns"):
+                values = [update[metric] for update in window
+                          if update.get(metric) is not None and np.isfinite(update[metric])]
+                row[label + "_" + metric] = float(np.mean(values)) if values else None
+        output.append(row)
+    return pd.DataFrame(output)
 
 
 def _aggregate(root, output, *, mode="paper", allow_partial=False):
@@ -318,6 +358,7 @@ def _aggregate(root, output, *, mode="paper", allow_partial=False):
     if training:
         frame = save("exp3_training_curves", pd.DataFrame(training), "exp3_rl_robustness")
         save("exp3_learning_summary", learning_curves(frame), "exp3_rl_robustness")
+        save("exp3_training_health", training_health(training), "exp3_rl_robustness")
     if representatives:
         save("exp4_representative", pd.DataFrame(representatives), "exp4_docking")
     if "exp1_scaling" in frames:

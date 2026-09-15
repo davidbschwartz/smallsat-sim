@@ -11,6 +11,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.config:
         p.error("Run per-experiment entry points for custom configurations")
+    if args.job_id:
+        p.error("Use per-experiment entry points for --job-id")
     mode = "--paper" if args.paper else "--smoke" if args.smoke else None
     failures = []
     for experiment in EXPERIMENTS:
@@ -25,6 +27,8 @@ def main(argv=None):
             cmd.append(mode)
         if args.plan:
             cmd.append("--plan")
+        if args.resume:
+            cmd.append("--resume")
         if subprocess.run(cmd).returncode:
             failures.append(experiment)
     if args.plan:
