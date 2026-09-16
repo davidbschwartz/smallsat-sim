@@ -6,11 +6,15 @@ jobs:
   cpu:
     runs-on: ubuntu-22.04
     env:
-      MUJOCO_GL: egl
+      MUJOCO_GL: osmesa
       WANDB_MODE: disabled
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - name: Install headless CPU rendering library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libosmesa6
       - name: Install locked CPU dependencies
         run: uv sync --locked --extra paper --group dev
       - name: Lint
