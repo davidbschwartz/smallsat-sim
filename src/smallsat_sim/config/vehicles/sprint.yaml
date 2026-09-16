@@ -1,0 +1,265 @@
+# SI units. Thrust commands are averaged force in N, not flight valve pulses.
+name: sprint
+bodies:
+- name: body0
+actuators:
+- name: thruster1
+  pos:
+  - 0.14591189122206594
+  - 0.0
+  - -0.1016
+  gear:
+  - -1
+  - 0
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster2
+  pos:
+  - 0.14591189122206594
+  - 0.0
+  - 0.1016
+  gear:
+  - -1
+  - 0
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster3
+  pos:
+  - -0.14591189122206594
+  - 0.0
+  - -0.1016
+  gear:
+  - 1
+  - 0
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster4
+  pos:
+  - -0.14591189122206594
+  - 0.0
+  - 0.1016
+  gear:
+  - 1
+  - 0
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster5
+  pos:
+  - -0.1016
+  - 0.14591189122206594
+  - 0.0
+  gear:
+  - 0
+  - -1
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster6
+  pos:
+  - 0.1016
+  - 0.14591189122206594
+  - 0.0
+  gear:
+  - 0
+  - -1
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster7
+  pos:
+  - -0.1016
+  - -0.14591189122206594
+  - 0.0
+  gear:
+  - 0
+  - 1
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster8
+  pos:
+  - 0.1016
+  - -0.14591189122206594
+  - 0.0
+  gear:
+  - 0
+  - 1
+  - 0
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster9
+  pos:
+  - 0.0
+  - -0.1016
+  - 0.14591189122206594
+  gear:
+  - 0
+  - 0
+  - -1
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster10
+  pos:
+  - 0.0
+  - 0.1016
+  - 0.14591189122206594
+  gear:
+  - 0
+  - 0
+  - -1
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster11
+  pos:
+  - 0.0
+  - -0.1016
+  - -0.14591189122206594
+  gear:
+  - 0
+  - 0
+  - 1
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+- name: thruster12
+  pos:
+  - 0.0
+  - 0.1016
+  - -0.14591189122206594
+  gear:
+  - 0
+  - 0
+  - 1
+  forcerange:
+  - 0
+  - 0.3780988372971425
+  ctrlrange:
+  - 0
+  - 0.3780988372971425
+  forcelimited: 'true'
+  ctrllimited: 'true'
+geoms:
+- name: shell
+  type: sphere
+  size:
+  - 0.1778
+- name: camera_left
+  type: cylinder
+  pos:
+  - 0.169
+  - -0.042
+  - 0.025
+  euler:
+  - 0
+  - 90
+  - 0
+  size:
+  - 0.018
+  - 0.012
+- name: camera_right
+  type: cylinder
+  pos:
+  - 0.169
+  - 0.042
+  - 0.025
+  euler:
+  - 0
+  - 90
+  - 0
+  size:
+  - 0.018
+  - 0.012
+physical:
+  length: 0.3556
+  width: 0.3556
+  height: 0.3556
+  mass: 15.875732950000002
+  diag_inertia:
+  - 0.1357847991911488
+  - 0.1357847991911488
+  - 0.1357847991911488
+  com_offset:
+  - 0
+  - 0
+  - 0
+assets:
+  kind: generic
+default_model: sprint
+metadata:
+  fidelity: Idealized AERCam Sprint; preflight nominal dynamics, approximate visual
+    geometry.
+  geometry: Equivalent cyclic thruster lines of action; nozzle positions moved along
+    thrust axes to spherical surface. Not flight coordinates or numbering.
+  sources:
+  - https://ntrs.nasa.gov/api/citations/19970026889/downloads/19970026889.pdf
+  - https://www.space-flight.org/AAS_meetings/1998_winter/abstracts/98-171.html
+  validation: docs/spacecraft_candidate_validation.md

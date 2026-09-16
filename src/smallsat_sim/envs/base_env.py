@@ -1,19 +1,21 @@
+"""Classical MuJoCo environment base class and shared setup."""
+
+from smallsat_sim.envs.rendering.classical import ClassicalRendering
+from smallsat_sim.envs.config import resolve_env_config
+from copy import deepcopy
+from smallsat_sim.model.vehicle import load_vehicle, validate_vehicle
 from typing import TypeVar
 import numpy as np
 import mujoco
-import mujoco.viewer
-import cv2
-import os
 import jax
 import jax.numpy as jnp
 from datetime import datetime
 
-from smallsat_sim.envs.dynamics import SymbolicModel
-from smallsat_sim.utils import xml_parser
-from smallsat_sim.envs.disturbances import DisturbanceList
-from smallsat_sim.envs.perturbations import PerturbationList
+from smallsat_sim.model.dynamics import SymbolicModel
+from smallsat_sim.model.mujoco_xml import build_mujoco_xml
+from smallsat_sim.envs.effects.disturbances import DisturbanceList
+from smallsat_sim.envs.effects.classical import PerturbationList
 from smallsat_sim.utils.logger import Logger
-from smallsat_sim import SMALLSAT_STEWARD_ROOT_DIR
 
 from argparse import Namespace
 from typing import Optional
@@ -22,12 +24,13 @@ from typing import Optional
 T = TypeVar("T", np.ndarray, jnp.ndarray)
 
 
-class BaseEnv(object):
+class BaseEnv(ClassicalRendering):
     def __init__(self, args: Namespace) -> None:
         # Initialize arguments
         self.args = args
 
-        # Global PRNG stream derived from configuration seed
+        # Environment-owned random streams derived from configuration seed
+        self.np_rng = np.random.RandomState(self.env_cfg.sim.seed)
         self._rng = jax.random.PRNGKey(self.env_cfg.sim.seed)
         self._rng, self._noise_key = jax.random.split(self._rng)
 
@@ -64,8 +67,9 @@ class BaseEnv(object):
         Resets environment.
         """
         mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
 
-        self.set_obs(v_frame="body")
+        self.set_obs(v_frame=self.env_cfg.sim.obs.v_frame)
         print("Environment reset.")
 
     def reset_to_state(self, pos: np.ndarray, att: np.ndarray) -> None:
@@ -87,7 +91,7 @@ class BaseEnv(object):
 
         mujoco.mj_forward(self.model, self.data)
 
-        self.set_obs(v_frame="body")
+        self.set_obs(v_frame=self.env_cfg.sim.obs.v_frame)
         print("Environment reset.")
 
     def step(self, input: np.ndarray) -> None:
@@ -102,14 +106,13 @@ class BaseEnv(object):
             # Update viewer
             if substep % self.env_cfg.viewer.viewer_decimation == 0:
                 self._update_viewer()
-                pass
-                # self._update_renderer() # Moved to planner to visualize ref. as well
 
             # Step in MuJoCo engine
             mujoco.mj_step(self.model, self.data)
 
         # Execute post physics steps
         self._post_physics_step()
+        self._update_renderer()
 
     def set_obs(self, v_frame: str = "body") -> None:
         """
@@ -124,39 +127,26 @@ class BaseEnv(object):
             np.array: Array of observations containing position, orientation, velocity
                       and angular velocity.
         """
-        # obs = [r (3),
-        #        q (4),
-        #        v (3), --> in body/inertial frame
-        #        omega (3)]
-
+        # Read the named free joint, not the last body's derived arrays. qpos
+        # and qvel contain the post-integration state even before mj_forward.
+        from smallsat_sim.utils.helpers import Rquat
+        body = int(self.model.body("body0").id)
+        joint = int(self.model.body_jntadr[body])
+        qadr = int(self.model.jnt_qposadr[joint])
+        vadr = int(self.model.jnt_dofadr[joint])
+        pose = self.data.qpos[qadr:qadr + 7].copy()
+        velocity = self.data.qvel[vadr:vadr + 3].copy()
         if v_frame == "body":
-
-            # Retrieve current rotation matrix
-            R = np.reshape(self.data.body("body0").xmat.copy(), (3, 3))
-
-            # Rotate intertial velocity to body velocity
-            v = R.T @ self.data.cvel[-1, 3:6]
-
-        elif v_frame == "inertial":
-
-            # Retrieve inertial velocity from MuJoCo
-            v = self.data.qvel[-1, :3].copy()
-
-        else:
-            raise RuntimeError(
-                f"Specified velocity frame {v_frame} not valid. "
-                "Must be either 'body' or 'inertial'."
-            )
-
-        obs = np.concatenate(
-            (self.data.xpos[-1], self.data.xquat[-1], v, self.data.qvel[3:6])
-        )
-
-        # Save ground truth observations
+            velocity = np.asarray(Rquat(pose[3:7])).T @ velocity
+        elif v_frame != "inertial":
+            raise ValueError(f"Unsupported velocity frame: {v_frame}")
+        obs = np.r_[pose, velocity, self.data.qvel[vadr + 3:vadr + 6]]
         self.obs_gt = obs
-
-        # Apply noise to observations
-        self.obs = self._apply_obs_noise(obs)
+        self.obs = self._apply_obs_noise(obs).copy()
+        norm = np.linalg.norm(self.obs[3:7])
+        if norm < 1e-12:
+            raise ValueError("Observation quaternion must be nonzero")
+        self.obs[3:7] /= norm
 
     def get_obs(self) -> T:
         """
@@ -181,10 +171,10 @@ class BaseEnv(object):
             # Single agent in MuJoCo
             if isinstance(obs, np.ndarray):
                 # Calculate noise
-                noise_r = np.random.normal(0, self.env_cfg.sim.noise.sigma_r, 3)
-                noise_q = np.random.normal(0, self.env_cfg.sim.noise.sigma_q, 4)
-                noise_v = np.random.normal(0, self.env_cfg.sim.noise.sigma_v, 3)
-                noise_w = np.random.normal(0, self.env_cfg.sim.noise.sigma_w, 3)
+                noise_r = self.np_rng.normal(0, self.env_cfg.sim.noise.sigma_r, 3)
+                noise_q = self.np_rng.normal(0, self.env_cfg.sim.noise.sigma_q, 4)
+                noise_v = self.np_rng.normal(0, self.env_cfg.sim.noise.sigma_v, 3)
+                noise_w = self.np_rng.normal(0, self.env_cfg.sim.noise.sigma_w, 3)
 
                 # Concatenate noise
                 noise = np.concatenate((noise_r, noise_q, noise_v, noise_w))
@@ -228,120 +218,36 @@ class BaseEnv(object):
         else:
             return obs
 
-    def get_sim_rendering(
-        self, output_filename: str, output_dir: Optional[str] = None
-    ) -> None:
+
+    def _load_cfg(
+        self, env_name: str, model_name: str | None = None, *, vehicle=None, config=None
+    ) -> tuple:
         """
-        Create and save a video rendering of the experiment.
-        """
-        if not self.args.video:
-            return
+        Load environment settings and the selected physical vehicle independently.
 
-        # Define video settings
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        fps = self.env_cfg.renderer.fps
-        height, width, _ = self.frames[0].shape
-
-        # Define save settings
-        if output_dir is None:
-            video_dir = os.path.join(SMALLSAT_STEWARD_ROOT_DIR, "videos")
-        else:
-            video_dir = (
-                output_dir
-                if os.path.isabs(output_dir)
-                else os.path.join(SMALLSAT_STEWARD_ROOT_DIR, output_dir)
-            )
-        os.makedirs(video_dir, exist_ok=True)  # Ensure the video directory exists
-
-        video_path = os.path.join(
-            video_dir,
-            output_filename + "_" + self.sim_start_time + ".mp4",
-        )
-
-        video_writer = cv2.VideoWriter(
-            video_path,
-            fourcc,
-            fps,
-            (width, height),
-        )
-
-        # Parse video frame by frame
-        for frame in self.frames:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            video_writer.write(frame)
-
-        # Save video at specified location
-        video_writer.release()
-
-        print(f"Video saved as {video_path}\n")
-
-        # Reset frames to free up memory
-        self.frames = []
-
-    def _create_viewer(self) -> None:
-        """
-        Creates a viewer to visualize simulation
-        """
-        # Create instance of MuJoCo viewer
-        self.viewer = mujoco.viewer.launch_passive(
-            self.model, self.data, key_callback=self._key_callback
-        )
-
-        # Set default camera options
-        self.viewer.cam.distance = 4.0
-        self.viewer.cam.trackbodyid = 2  # tracks smallsat
-        self.viewer.cam.azimuth = -65.0
-        self.viewer.cam.elevation = -44
-        self.viewer.cam.type = 1
-        self.viewer.cam.lookat = self.data.qpos[:3]
-
-    def _create_renderer(self) -> None:
-        """
-        Creates a renderer to visualize the experiments (to later save them to a video).
-        """
-        # Create instance of MuJoCo renderer
-        self.renderer = mujoco.Renderer(
-            self.model,
-            width=self.env_cfg.renderer.width,
-            height=self.env_cfg.renderer.height,
-        )
-
-        # Set up the scene and the default camera options
-        self.cam = mujoco.MjvCamera()
-        self.cam.distance = 4.0
-        self.cam.trackbodyid = 2  # tracks smallsat
-        self.cam.azimuth = -65.0
-        self.cam.elevation = -44
-        self.cam.type = 1
-        self.cam.lookat = self.data.qpos[:3]
-
-        # Save frames to create the video
-        self.frames = []
-
-    def _load_cfg(self, env_name: str, model_name: str | None = None) -> tuple:
-        """
-        Loads and returns the following config files:
-            - env config file
-            - model config file
+        Episode poses stay in env_cfg.Bodies; an asset does not replace reset settings.
         """
         # Save env and model names for later use
         self.env_name = env_name
         self.model_name = model_name
 
-        # Dynamically import the correct env config module
-        module = __import__(f"smallsat_sim.envs.{env_name}.cfg", fromlist=["config"])
-        env_cfg = module.config.EnvConfig()
+        # Resolve fresh settings without importing per-vehicle modules.
+        if config is None:
+            env_cfg = resolve_env_config(env_name)
+        else:
+            env_cfg = deepcopy(config)
 
-        model_module_name = model_name or getattr(env_cfg, "model", None)
-        if model_module_name is None:
+        asset_name = model_name or getattr(env_cfg, "model", None)
+        if asset_name is None and vehicle is None:
             raise ValueError(
                 "Model name not provided and environment config does not define 'model'."
             )
 
-        module = __import__(
-            f"smallsat_sim.model.{model_module_name}.cfg", fromlist=["config"]
+        model_cfg = (
+            load_vehicle(f"vehicles/{asset_name}.yaml")
+            if vehicle is None
+            else validate_vehicle(vehicle)
         )
-        model_cfg = module.config.ModelConfig()
 
         return env_cfg, model_cfg
 
@@ -351,65 +257,14 @@ class BaseEnv(object):
         Creates a viewer depending on headless flag.
         """
         # Generate xml using env and model config files
-        xml = xml_parser.generate_mujoco_xml(self.env_cfg, self.model_cfg)
-        
+        xml = build_mujoco_xml(self.env_cfg, self.model_cfg, scene=getattr(self, "scene", "gateway"))
+
         # Create model and data instances
         self.model = mujoco.MjModel.from_xml_string(xml)
         self.data = mujoco.MjData(self.model)
+        mujoco.mj_forward(self.model, self.data)
+        self._setup_rendering(args)
 
-        # Launch the viewer
-        if not args.headless:
-            self._create_viewer()
-        else:
-            # If sim is run in headless mode, set the update_viewer method
-            # to a lambda function which essentially does nothing
-            self.viewer = None
-            self._update_viewer = lambda *args, **kwargs: None
-
-        # Launch the renderer to create a video
-        if args.video:
-            self._create_renderer()
-        else:
-            # Same logic as for the viewer
-            self.renderer = None
-            self._update_renderer = lambda *args, **kwargs: None
-
-    def _update_viewer(self) -> None:
-        """
-        Updates the viewer
-        """
-        self.viewer.sync()
-
-    def _update_renderer(self) -> None:
-        """
-        Updates the renderer.
-        """
-        self.renderer.update_scene(self.data, self.cam)
-        sim_img = self.renderer.render().copy()
-        self.frames.append(sim_img)
-
-    def close(self) -> None:
-        """
-        Release viewer/renderer resources if they exist.
-        """
-        try:
-            if self.viewer is not None:
-                self.viewer.close()
-        except Exception:
-            pass
-        finally:
-            self.viewer = None
-
-        try:
-            if self.renderer is not None:
-                self.renderer.close()
-        except Exception:
-            pass
-        finally:
-            self.renderer = None
-
-        self._update_viewer = lambda *args, **kwargs: None
-        self._update_renderer = lambda *args, **kwargs: None
 
     def __del__(self):
         self.close()

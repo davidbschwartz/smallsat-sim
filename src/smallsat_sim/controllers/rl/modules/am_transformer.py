@@ -1,217 +1,56 @@
-import jax
-import jax.numpy as jnp
+"""Small deterministic temporal transformer for the CNN comparison."""
+
 from flax import nnx
+import jax.numpy as jnp
 
 
-def _causal_mask(length: int) -> jnp.ndarray:
-    """
-    Return a causal mask with zeros on/under the diagonal and large negative
-    values elsewhere so it can be added to attention logits.
-    """
-    mask = jnp.tril(jnp.ones((length, length), dtype=jnp.float32))
-    return jnp.where(mask > 0, 0.0, -1e9)
+class AttentionBlock(nnx.Module):
+    def __init__(self, width, heads, *, rngs):
+        self.norm1 = nnx.LayerNorm(width, rngs=rngs)
+        self.attention = nnx.MultiHeadAttention(heads, width, decode=False, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(width, rngs=rngs)
+        self.up = nnx.Linear(width, 2 * width, rngs=rngs)
+        self.down = nnx.Linear(2 * width, width, rngs=rngs)
 
-
-class LayerNorm(nnx.Module):
-    def __init__(self, features: int):
-        self.gamma = nnx.Param(jnp.ones((features,), dtype=jnp.float32))
-        self.beta = nnx.Param(jnp.zeros((features,), dtype=jnp.float32))
-        self.eps = 1e-6
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        mean = x.mean(axis=-1, keepdims=True)
-        var = x.var(axis=-1, keepdims=True)
-        x_hat = (x - mean) / jnp.sqrt(var + self.eps)
-        return self.gamma * x_hat + self.beta
-
-
-class FeedForward(nnx.Module):
-    def __init__(
-        self,
-        d_model: int,
-        hidden_dim: int,
-        dropout_rate: float,
-        rngs: nnx.Rngs,
-    ):
-        self.fc1 = nnx.Linear(d_model, hidden_dim, rngs=rngs)
-        self.fc2 = nnx.Linear(hidden_dim, d_model, rngs=rngs)
-        self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
-
-    def __call__(self, x: jnp.ndarray, *, training: bool = False) -> jnp.ndarray:
-        x = jax.nn.gelu(self.fc1(x))
-        x = self.dropout(x, deterministic=not training)
-        return self.fc2(x)
-
-
-class MultiHeadSelfAttention(nnx.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        dropout_rate: float,
-        rngs: nnx.Rngs,
-    ):
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.q_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.k_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.v_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.out_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
-
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        mask: jnp.ndarray,
-        *,
-        training: bool = False,
-    ) -> jnp.ndarray:
-        """
-        Args:
-            x: [B, L, D] tensor
-            mask: [L, L] causal mask
-        """
-        batch_size, seq_len, _ = x.shape
-        q = (
-            self.q_proj(x)
-            .reshape(batch_size, seq_len, self.n_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        k = (
-            self.k_proj(x)
-            .reshape(batch_size, seq_len, self.n_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        v = (
-            self.v_proj(x)
-            .reshape(batch_size, seq_len, self.n_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-
-        scale = 1.0 / jnp.sqrt(self.head_dim)
-        logits = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
-        logits = logits + mask[None, None, :, :]
-        weights = jax.nn.softmax(logits, axis=-1)
-        weights = self.dropout(weights, deterministic=not training)
-        attn = jnp.einsum("bhij,bhjd->bhid", weights, v)
-        attn = attn.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.d_model)
-        return self.out_proj(attn)
-
-
-class TransformerBlock(nnx.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        mlp_dim: int,
-        dropout_rate: float,
-        rngs: nnx.Rngs,
-    ):
-        self.norm1 = LayerNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout_rate, rngs)
-        self.norm2 = LayerNorm(d_model)
-        self.ff = FeedForward(d_model, mlp_dim, dropout_rate, rngs)
-        self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
-
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        mask: jnp.ndarray,
-        *,
-        training: bool = False,
-    ) -> jnp.ndarray:
-        attn_out = self.attn(self.norm1(x), mask, training=training)
-        attn_out = self.dropout(attn_out, deterministic=not training)
-        x = x + attn_out
-        ff_out = self.ff(self.norm2(x), training=training)
-        ff_out = self.dropout(ff_out, deterministic=not training)
-        return x + ff_out
+    def __call__(self, x):
+        x = x + self.attention(self.norm1(x), decode=False)
+        return x + self.down(nnx.gelu(self.up(self.norm2(x))))
 
 
 class TransformerAdaptationModule(nnx.Module):
-    """
-    Transformer-based adaptation module mirroring the interface of AdaptationModule. 
-    Accepts a history of concatenated state-action vectors with shape [T, state_action_dim]
-    and returns the predicted extrinsics for the most recent timestep. Optionally exposes a
-    probabilistic head (mean and log standard deviation) when ``return_stats`` is set to True.
-    """
-
     def __init__(
         self,
-        n_steps: int,
-        state_action_dim: int,
-        ext_dim: int,
-        d_model: int = 128,
-        n_heads: int = 4,
-        mlp_dim: int = 256,
-        n_layers: int = 3,
-        dropout_rate: float = 0.05,
-        rngs: nnx.Rngs | None = None,
-    ):
-        super().__init__()
-        if rngs is None:
-            rngs = nnx.Rngs(params=0, dropout=1)
-        self.n_steps = n_steps
-        self.state_action_dim = state_action_dim
-        self.ext_dim = max(1, ext_dim)
-        self.d_model = d_model
-        self.input_proj = nnx.Linear(state_action_dim, d_model, rngs=rngs)
-        self.pos_embedding = nnx.Param(
-            0.02 * jax.random.normal(rngs.params(), (n_steps, d_model))
-        )
-        self.input_dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
-        self.blocks = [
-            TransformerBlock(d_model, n_heads, mlp_dim, dropout_rate, rngs)
-            for _ in range(n_layers)
-        ]
-        self.norm = LayerNorm(d_model)
-        self.mu_head = nnx.Linear(d_model, self.ext_dim, rngs=rngs)
-        self.log_sigma_head = nnx.Linear(d_model, self.ext_dim, rngs=rngs)
-
-    def __call__(
-        self,
-        history: jnp.ndarray,
+        n_steps,
+        state_action_dim,
+        ext_dim,
         *,
-        return_stats: bool = False,
-        training: bool = False,
-    ) -> jnp.ndarray | tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Args:
-            history: [T, state_action_dim] with T == n_steps and the most
-                     recent transition at index -1.
-        Returns:
-            extrinsic prediction for the most recent timestep, shape [ext_dim].
-        """
-        if history.ndim != 2:
+        rngs,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+    ):
+        if min(n_steps, state_action_dim, ext_dim, n_layers) <= 0 or d_model % n_heads:
             raise ValueError(
-                "history must be a 2D array of shape [T, state_action_dim]"
+                "Positive dimensions and width divisible by heads required"
             )
-        if history.shape[0] != self.n_steps:
-            raise ValueError(f"expected {self.n_steps} steps, got {history.shape[0]}")
-        if history.shape[1] != self.state_action_dim:
-            raise ValueError(
-                f"expected feature dim {self.state_action_dim}, "
-                f"got {history.shape[1]}"
-            )
+        self.n_steps, self.state_action_dim = n_steps, state_action_dim
+        self.encoder = nnx.Linear(state_action_dim, d_model, rngs=rngs)
+        positions = jnp.arange(n_steps)[:, None]
+        frequency = jnp.exp(-jnp.log(10000.0) * jnp.arange(0, d_model, 2) / d_model)
+        self.positions = jnp.stack(
+            (jnp.sin(positions * frequency), jnp.cos(positions * frequency)), axis=-1
+        ).reshape(n_steps, d_model)
+        self.blocks = [
+            AttentionBlock(d_model, n_heads, rngs=rngs) for _ in range(n_layers)
+        ]
+        self.norm = nnx.LayerNorm(d_model, rngs=rngs)
+        self.output = nnx.Linear(d_model, ext_dim, rngs=rngs)
 
-        # [1, T, d_model] after projection and learned positional encoding.
-        x = self.input_proj(history)
-        x = x + self.pos_embedding.value
-        x = self.input_dropout(x, deterministic=not training)
-        x = jnp.expand_dims(x, axis=0)
-        mask = _causal_mask(self.n_steps)
-
+    def __call__(self, history):
+        if history.shape[-2:] != (self.n_steps, self.state_action_dim):
+            raise ValueError("Expected (..., history_length, state_action_dim) history")
+        # All tokens belong to the completed history; no future observations exist.
+        x = self.encoder(history) + self.positions
         for block in self.blocks:
-            x = block(x, mask, training=training)
-
-        x = self.norm(x)
-        last_token = x[:, -1, :]  # [1, d_model]
-        mu = self.mu_head(last_token)
-        log_sigma = self.log_sigma_head(last_token)
-        mu = jnp.squeeze(mu, axis=0)
-        log_sigma = jnp.squeeze(log_sigma, axis=0)
-        if return_stats:
-            return mu, log_sigma
-        return mu
+            x = block(x)
+        return self.output(self.norm(x)[..., -1, :])

@@ -36,7 +36,7 @@ from l4acados.models import PyTorchFeatureSelector
 # from smallsat_sim.external.zero_order_gp_mpc_package.external.gpytorch_utils.gp_hyperparam_training import (
 #     train_gp_model,
 # )
-from smallsat_sim.gp_utils.gp_hyperparam_training import train_gp_model
+
 
 from smallsat_sim.controllers.gp_mpc.online_learning.utils import ResidualScaler
 from scipy.stats import norm
@@ -50,7 +50,7 @@ class SlidingWindow(OnlineLearningStrategy):
 
     def __init__(self, max_num_points: int = 200, device: str = "cpu") -> None:
         # Initialize superclass
-        super().__init__(max_num_points, device)
+        super().__init__(max_num_points=max_num_points, data_selection="newest", device=device)
 
         # Initialize SlidingWindow-specific variables
         self.timestamps = []
@@ -72,10 +72,10 @@ class SlidingWindow(OnlineLearningStrategy):
 
         # Convert to tensor
         if not torch.is_tensor(x_input):
-            x_input = to_tensor(arr=x_input, device=self.device)
+            x_input, _ = to_tensor(arr=x_input, device=self.device)
 
         if not torch.is_tensor(y_target):
-            y_target = to_tensor(arr=y_target, device=self.device)
+            y_target, _ = to_tensor(arr=y_target, device=self.device)
 
         # Extend to 2D for further computation
         x_input = torch.atleast_2d(x_input)
@@ -141,36 +141,14 @@ class SlidingWindow(OnlineLearningStrategy):
             return fantasy_model
 
     def _check_training(self, fantasy_model: ExactGP) -> ExactGP:
-
-        if self.counter % self.max_num_points == 0 and False:
-            # Before training
-            for name, param in fantasy_model.named_parameters():
-                print(f"Parameter {name} has shape {param.shape} and values:")
-                print(param)
-
-            fantasy_model, _ = train_gp_model(
-                fantasy_model,
-                torch_seed=456,
-                training_iterations=300,
-            )
-
-            # After training
-            for name, param in fantasy_model.named_parameters():
-                print(f"Parameter {name} has shape {param.shape} and values:")
-                print(param)
-
-            # print(fantasy_model.covar_module.base_kernel.variance.data)
-            # print(fantasy_model.likelihood.noise.data)
-
-            return fantasy_model
-        else:
-            return fantasy_model
+        # Hyperparameters are fixed; this strategy updates the online data only.
+        return fantasy_model
 
 
 class SlidingWindowPlus(OnlineLearningStrategy):
     def __init__(self, max_num_points: int = 200, device: str = "cpu") -> None:
         # Initialize superclass
-        super().__init__(max_num_points, device)
+        super().__init__(max_num_points=max_num_points, data_selection="newest", device=device)
 
         # Initialize SlidingWindow-specific variables
         self.timestamps = []
@@ -179,10 +157,10 @@ class SlidingWindowPlus(OnlineLearningStrategy):
         self.counter = -1
 
         # Initialize fault detector flag counter
-        self.fault_counter = 0
+        self.flag_counter = 0
 
         # Initialize past input
-        self.x_input_past = torch.zeros((1,27))
+        self.x_input_past = None
 
     def process(
         self,
@@ -198,10 +176,10 @@ class SlidingWindowPlus(OnlineLearningStrategy):
 
         # Convert to tensor
         if not torch.is_tensor(x_input):
-            x_input = to_tensor(arr=x_input, device=self.device)            
+            x_input, _ = to_tensor(arr=x_input, device=self.device)
 
         if not torch.is_tensor(y_target):
-            y_target = to_tensor(arr=y_target, device=self.device)
+            y_target, _ = to_tensor(arr=y_target, device=self.device)
 
         # Extend to 2D for further computation
         x_input = torch.atleast_2d(x_input)
@@ -238,12 +216,6 @@ class SlidingWindowPlus(OnlineLearningStrategy):
         ):
             return gp_model
         
-        if True:
-            delta = torch.norm(gp_feature_selector(x_input-self.x_input_past), 2)
-            if delta < 0.01:
-                #print(f"Rejected point due to low delta of {delta}")
-                return gp_model
-
         delta = torch.norm(gp_feature_selector(x_input-self.x_input_past), 2)
         if delta < 0.01:
             print(f"Rejected point due to low delta of {delta}")

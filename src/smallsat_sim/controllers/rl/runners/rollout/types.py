@@ -1,8 +1,62 @@
+"""Typed rollout state containers and callback signatures."""
+
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+
+from .context import ContextHistory
+
+PolicyInputFn = Callable[
+    [int, jnp.ndarray, jnp.ndarray, Any],
+    tuple[jnp.ndarray, Any],
+]
+SamplePolicyFn = Callable[
+    [int, jnp.ndarray, jnp.ndarray, Any],
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Any],
+]
+UpdateContextFn = Callable[
+    [int, Any, jnp.ndarray, jnp.ndarray, jnp.ndarray, Any],
+    tuple[jnp.ndarray, Any, Any],
+]
+BootstrapValueFn = Callable[
+    [int, Any, jnp.ndarray, jnp.ndarray, Any],
+    tuple[jnp.ndarray, jnp.ndarray, Any],
+]
+StateFeaturesFn = Callable[[Any, jnp.ndarray], jnp.ndarray]
+# step(state, actions, reference, config, context, previous_features)
+# returns (next_state, output, next_features); reset always accepts a per-env mask.
+StepFn = Callable[
+    [Any, jnp.ndarray, jnp.ndarray, Any, jnp.ndarray, jnp.ndarray],
+    tuple[Any, Any, jnp.ndarray],
+]
+ResetFn = Callable[[Any, Any, jnp.ndarray], Any]
+
+
+class PolicyState(NamedTuple):
+    """Policy-side arrays carried through collection, separate from physics."""
+    history: ContextHistory
+    latent_actions: jax.Array
+
+
+class TransitionLabels(NamedTuple):
+    """Learning targets recorded after a transition, before history resets."""
+    latent_actions: jax.Array
+    normalized_context: jax.Array
+    history_full: jax.Array
+
+
+class RolloutCarry(NamedTuple):
+    """Only these values advance from one scan iteration to the next."""
+
+    env_state: Any
+    features: jax.Array
+    context: jax.Array
+    key: jax.Array
+    policy_state: Any
+    episode_return: jax.Array
+    episode_length: jax.Array
 
 
 @dataclass
@@ -16,68 +70,38 @@ class FunctionalRolloutCallbacks:
     buffers for the adaptation module).
     """
 
-    prepare_policy_input: Callable[
-        [int, jnp.ndarray, jnp.ndarray, Any], tuple[jnp.ndarray, Any]
-    ]
-    sample_policy: Callable[
-        [int, jnp.ndarray, jnp.ndarray, Any],
-        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Any],
-    ]
-    post_step: Callable[
-        [int, Any, jnp.ndarray, jnp.ndarray, jnp.ndarray, Any],
-        tuple[jnp.ndarray, Any, Any],
-    ]
-    bootstrap_value: Callable[
-        [int, Any, jnp.ndarray, jnp.ndarray, Any],
-        tuple[jnp.ndarray, jnp.ndarray, Any],
-    ]
+    prepare_policy_input: PolicyInputFn
+    sample_policy: SamplePolicyFn
+    update_context: UpdateContextFn
+    bootstrap_value: BootstrapValueFn
 
 
 @dataclass
 class FunctionalRolloutResult:
     """
-    Batched outputs produced by `run_functional_rollout`.
+    Collected arrays have leading axes [time, environment].
+
+    done_masks marks both terminals and timeouts; bootstrap_values contains
+    pre-reset values only at timeouts and the final rollout step.
     """
 
     step_outputs: Any
     actions: jnp.ndarray
     values: jnp.ndarray
     logp: jnp.ndarray
-    residuals: jnp.ndarray
+    context: jnp.ndarray
     episode_returns: jnp.ndarray
     done_flags: jnp.ndarray
     done_masks: jnp.ndarray
     terminated_masks: jnp.ndarray
     truncated_masks: jnp.ndarray
     bootstrap_values: jnp.ndarray
-    aux: Any
+    labels: Any
     final_state: Any
-    final_residuals: jnp.ndarray
+    final_context: jnp.ndarray
     final_rng: jnp.ndarray
-    final_extra: Any
-
-
-@dataclass
-class AdaptationRolloutExtra:
-    history: jnp.ndarray
-    counts: jnp.ndarray
-
-
-def _adaptation_rollout_extra_flatten(extra: "AdaptationRolloutExtra"):
-    children = (extra.history, extra.counts)
-    return children, None
-
-
-def _adaptation_rollout_extra_unflatten(aux_data, children):
-    history, counts = children
-    return AdaptationRolloutExtra(history=history, counts=counts)
-
-
-jax.tree_util.register_pytree_node(
-    AdaptationRolloutExtra,
-    _adaptation_rollout_extra_flatten,
-    _adaptation_rollout_extra_unflatten,
-)
+    final_policy_state: Any
+    trajectory: Any = None
 
 
 @dataclass
@@ -86,68 +110,16 @@ class _FunctionalRolloutStep:
     actions: jnp.ndarray
     values: jnp.ndarray
     logp: jnp.ndarray
-    residuals: jnp.ndarray
+    context: jnp.ndarray
     episode_return: jnp.ndarray
     done_flag: jnp.ndarray
     done_mask: jnp.ndarray
     terminated_mask: jnp.ndarray
     truncated_mask: jnp.ndarray
     bootstrap_value: jnp.ndarray
-    aux: Any
+    labels: Any
+    trajectory: Any = None
 
 
-def _functional_rollout_step_flatten(step: "_FunctionalRolloutStep"):
-    children = (
-        step.step_output,
-        step.actions,
-        step.values,
-        step.logp,
-        step.residuals,
-        step.episode_return,
-        step.done_flag,
-        step.done_mask,
-        step.terminated_mask,
-        step.truncated_mask,
-        step.bootstrap_value,
-        step.aux,
-    )
-    return children, None
-
-
-def _functional_rollout_step_unflatten(aux_data, children):
-    (
-        step_output,
-        actions,
-        values,
-        logp,
-        residuals,
-        episode_return,
-        done_flag,
-        done_mask,
-        terminated_mask,
-        truncated_mask,
-        bootstrap_value,
-        aux,
-    ) = children
-    return _FunctionalRolloutStep(
-        step_output=step_output,
-        actions=actions,
-        values=values,
-        logp=logp,
-        residuals=residuals,
-        episode_return=episode_return,
-        done_flag=done_flag,
-        done_mask=done_mask,
-        terminated_mask=terminated_mask,
-        truncated_mask=truncated_mask,
-        bootstrap_value=bootstrap_value,
-        aux=aux,
-    )
-
-
-jax.tree_util.register_pytree_node(
-    _FunctionalRolloutStep,
-    _functional_rollout_step_flatten,
-    _functional_rollout_step_unflatten,
-)
-
+jax.tree_util.register_dataclass(_FunctionalRolloutStep)
+jax.tree_util.register_dataclass(FunctionalRolloutResult)

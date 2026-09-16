@@ -12,7 +12,9 @@ import numpy as np
 import casadi as ca
 import control
 
-from scipy.linalg import solve_discrete_are
+from scipy.linalg import solve_discrete_are, expm
+from scipy.optimize import lsq_linear
+from smallsat_sim.controllers.state import body_state
 
 
 class LQRController(BaseController):
@@ -35,81 +37,47 @@ class LQRController(BaseController):
         self.nx = self.x.shape[0]
         self.nu = self.u.shape[0]
 
-        # Compute the Jacobians
-        self.A_sym = ca.jacobian(self.f, self.x)
-        self.B_sym = ca.jacobian(self.f, self.u)
-
-        # Set reference values for parts of the states
+        self._linearization = ca.Function("lqr_linearization", [self.x, self.u],
+                                           [ca.jacobian(self.f, self.x), ca.jacobian(self.f, self.u)])
         self.v_ref = np.zeros((3, 1))
         self.omega_ref = np.zeros((3, 1))
-
-        # Get the cost function matrices
-        self.Q = self.ctrl_cfg.cost.Q + 1e-5 * np.eye(
-            self.nx, self.nx
-        )  # Perturb for numerical stability
-        self.R = self.ctrl_cfg.cost.R
-        # Use reduced error-state for LQR (drop quaternion scalar component).
-        self._red_idx = [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        self._red_nx = len(self._red_idx)
-        self._last_stable_gain = np.zeros((self.nu, self._red_nx))
+        self.Q = np.asarray(self.ctrl_cfg.cost.Q) + 1e-5 * np.eye(self.nx)
+        self.R = np.asarray(self.ctrl_cfg.cost.R)
         self.dt = env.env_cfg.sim.dt * self.ctrl_cfg.control_decimation
+        self._gain_key = None
+        self._gain = None
+        ranges = np.asarray([a.forcerange for a in env.model_cfg.actuators])
+        self._lower, self._upper = ranges.T
 
-    def check_controllability(self, A: np.ndarray, B: np.ndarray) -> bool:
+    def get_lqr_gain(self, x):
+        """Linearize in a quaternion tangent chart at the reference, then use ZOH.
+
+        Coordinates are world position, reference-body quaternion vector error,
+        body linear velocity and body angular velocity. No singular quaternion
+        scalar deletion, even at 180 degree target attitudes.
         """
-        Check if the system is controllable.
-        """
-        ctrb_matrix = control.ctrb(A, B)
-
-        if np.linalg.matrix_rank(ctrb_matrix) != A.shape[0]:
-            print("System is not controllable.")
-            return False
-
-        return True
-
-    def get_lqr_gain(self, x: np.ndarray) -> np.ndarray:
-        """
-        Calculate the LQR gain.
-        """
-
-        # Define the operating point
-        x_s = ca.SX(x)
-        u_s = ca.SX.zeros(self.model.nu, 1)
-
-        # Linearize the model around the operating point
-        A_num = ca.substitute(self.A_sym, self.x, x_s)
-        B_num = ca.substitute(self.B_sym, self.u, u_s)
-
-        # Convert the A and B matrices to NumPy
-        A = np.array(ca.DM(A_num).full())
-        B = np.array(ca.DM(B_num).full())
-
-        if not (np.all(np.isfinite(A)) and np.all(np.isfinite(B))):
-            print("[LQR] Non-finite entries in linearization; reusing previous gain.")
-            return self._last_stable_gain
-
-        # Discretize the system (Euler discretization)
-        A = np.eye(self.nx) + A * self.dt
-        B = B * self.dt
-
-        # Reduce to a 12D error-state by dropping quaternion scalar component.
-        A_red = A[np.ix_(self._red_idx, self._red_idx)]
-        B_red = B[self._red_idx, :]
-
-        # Check if the system is controllable (for debugging purposes)
-        _ = self.check_controllability(A_red, B_red)
-
-        try:
-            Q_red = self.Q[np.ix_(self._red_idx, self._red_idx)]
-            P = solve_discrete_are(A_red, B_red, Q_red, self.R)
-        except np.linalg.LinAlgError:
-            print("[LQR] DARE failed; reusing previous gain.")
-            return self._last_stable_gain
-
-        # Compute the LQR gain
-        K = np.linalg.inv(B_red.T @ P @ B_red + self.R) @ (B_red.T @ P @ A_red)
-
-        self._last_stable_gain = K
-        return K
+        key = np.asarray(x, dtype=float).tobytes()
+        if key == self._gain_key:
+            return self._gain
+        q = self._normalize_quat(x[3:7])
+        w, v = q[0], q[1:]
+        skew = np.array([[0., -v[2], v[1]], [v[2], 0., -v[0]], [-v[1], v[0], 0.]])
+        lift = np.zeros((13, 12))
+        lift[:3, :3] = np.eye(3)
+        lift[3:7, 3:6] = np.vstack((-v, w * np.eye(3) + skew))
+        lift[7:, 6:] = np.eye(6)
+        A, B = (np.asarray(value) for value in self._linearization(x, np.zeros(self.nu)))
+        A, B = lift.T @ A @ lift, lift.T @ B
+        block = np.zeros((12 + self.nu, 12 + self.nu))
+        block[:12, :12], block[:12, 12:] = A, B
+        discrete = expm(block * self.dt)
+        A, B = discrete[:12, :12], discrete[:12, 12:]
+        P = solve_discrete_are(A, B, lift.T @ self.Q @ lift, self.R)
+        gain = np.linalg.solve(B.T @ P @ B + self.R, B.T @ P @ A)
+        if not np.all(np.isfinite(gain)):
+            raise RuntimeError("LQR produced a nonfinite gain")
+        self._gain_key, self._gain = key, gain
+        return gain
 
     def _normalize_quat(self, q: np.ndarray) -> np.ndarray:
         eps = 1e-12
@@ -120,14 +88,14 @@ class LQRController(BaseController):
 
     def _quat_error(self, q_ref: np.ndarray, q: np.ndarray) -> np.ndarray:
         """
-        Return error quaternion q_err = q_ref ⊗ conj(q),
+        Return error quaternion q_err = conj(q_ref) ⊗ q,
         adjusted to the shortest path.
         """
         q_ref = self._normalize_quat(q_ref)
         q = self._normalize_quat(q)
         if np.dot(q_ref, q) < 0:
             q = -q
-        q_err = quat_multiply(q_ref, quat_conjugate(q))
+        q_err = quat_multiply(quat_conjugate(q_ref), q)
         if q_err[0] < 0:
             q_err = -q_err
         return q_err
@@ -145,22 +113,22 @@ class LQRController(BaseController):
         """
 
         # Get current state
-        x = env.obs[0:13]
+        x = body_state(env)
         r = x[0:3]
         q = x[3:7]
         v_body = x[7:10]
         omega = x[10:13]
-        v_inertial = self._body_to_inertial_vel(q, v_body)
 
         # Get the reference position
-        r_ref, quat_ref = self.planner.get_reference(env.obs)
+        r_ref, quat_ref = self.planner.get_reference(env.get_obs())
         r_ref = np.asarray(r_ref).reshape(3,)
-        quat_ref = np.asarray(quat_ref).reshape(4,)
+        quat_ref = self._normalize_quat(np.asarray(quat_ref).reshape(4,))
+        ref_body_velocity = np.asarray(Rquat(quat_ref)).T @ self.v_ref.reshape(3,)
         x_ref = np.concatenate(
             (
                 r_ref,
                 quat_ref,
-                self.v_ref.reshape(3,),
+                ref_body_velocity,
                 self.omega_ref.reshape(3,),
             )
         )
@@ -175,7 +143,7 @@ class LQRController(BaseController):
             (
                 r - r_ref,
                 eps_err,
-                v_inertial - self.v_ref.reshape(3,),
+                v_body - ref_body_velocity,
                 omega - self.omega_ref.reshape(3,),
             )
         )
@@ -183,7 +151,21 @@ class LQRController(BaseController):
         # Compute optimal control signal
         u_opt = -self.K @ x_err
 
-        return u_opt
+        # LQR optimizes signed inputs; physical thrusters are unilateral.
+        matrix = self.model.mixer
+        scale = np.maximum(np.linalg.norm(matrix, axis=1), 1e-12)
+        weighted = matrix / scale[:, None]
+        fixed = self._upper <= self._lower
+        command = self._lower.copy()
+        if np.any(~fixed):
+            target = weighted @ (u_opt - command)
+            result = lsq_linear(weighted[:, ~fixed], target,
+                                bounds=(np.zeros(np.sum(~fixed)),
+                                        (self._upper - self._lower)[~fixed]), tol=1e-10)
+            if not result.success or not np.all(np.isfinite(result.x)):
+                raise RuntimeError("LQR thrust allocation failed")
+            command[~fixed] += result.x
+        return command
 
     def _log(self, run_id: int, timestamp: float, env: BaseEnv) -> None:
         """

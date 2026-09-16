@@ -1,0 +1,36 @@
+# Import examples.position_task before constructing this preset.
+vehicle: examples/position_only
+asset: demo_spacecraft.yaml
+reward: examples/position_effort/v1
+failures: "off"
+log: false
+planner_radius: 0
+overrides:
+  RL:
+    termination: examples/position_only/v1
+    num_envs: 2
+    rollout_backend: freeflyer
+    use_adaptive_approach: false
+    PPO:
+      steps_per_epoch: 8
+      max_ep_len: 6
+      num_minibatches: 1
+      actor_training_epochs: 1
+      critic_training_epochs: 1
+    custom_faults:
+      - sample: examples.custom_effects:sample_motor_loss
+        apply: examples.custom_effects:apply_motor_loss
+        version: '1'
+        probability: 1.0
+        start_time: 0.05
+        params:
+          actuator: thruster1
+          minimum: 0.2
+          maximum: 0.8
+    custom_disturbances:
+      - sample: examples.custom_effects:sample_wrench
+        apply: examples.custom_effects:apply_wrench
+        version: '1'
+        start_time: 0.1
+        params:
+          wrench: [0.01, 0, 0, 0, 0, 0]

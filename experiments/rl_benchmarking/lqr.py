@@ -1,6 +1,12 @@
-from experiments.rl_benchmarking.rl_benchmarker import Benchmarker
+"""Run the LQR classical-controller benchmark."""
+
+from .rl_benchmarker import Benchmarker
 
 
-benchmarker = Benchmarker(run_name="lqr")
+def main():
+    benchmarker = Benchmarker(run_name="lqr")
+    benchmarker.deploy_and_test_classic(controller_type="lqr")
 
-benchmarker.deploy_and_test_classic(controller_type="lqr")
+
+if __name__ == "__main__":
+    main()

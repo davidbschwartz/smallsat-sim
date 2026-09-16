@@ -1,0 +1,30 @@
+# Nominal AERCam Sprint setpoint training smoke preset; not a convergence recipe.
+vehicle: sprint_rl
+asset: vehicles/sprint.yaml
+controller: rl
+algorithm: ppo
+planner: oracle_rl
+planner_radius: 0.0
+reward: vec_env/full_pose
+failures: "off"
+run_name: sprint_setpoint
+headless: true
+log: false
+overrides:
+  sim.seed: 0
+  Bodies.max_start_offset: 0.2
+  RL:
+    num_envs: 4
+    rollout_backend: freeflyer
+    use_adaptive_approach: false
+    policy_hidden_sizes: [32, 32]
+    checkpoint_dir: experiments/rl_results/sprint_setpoint
+    episode_len: 128
+    n_evals: 1
+    PPO:
+      steps_per_epoch: 128
+      epochs: 1
+      max_ep_len: 128
+      num_minibatches: 4
+      actor_training_epochs: 2
+      critic_training_epochs: 2

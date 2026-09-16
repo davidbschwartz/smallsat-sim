@@ -1,0 +1,15 @@
+# Construct a PPO training experiment without randomized faults.
+vehicle: astrobee_rl
+asset: vehicles/astrobee.yaml
+controller: rl/on_policy
+planner: oracle_rl
+planner_radius: 0.0
+algorithm: ppo
+reward: vec_env/full_pose
+failures: null
+run_name: ppo_nominal
+log: false
+headless: true
+overrides:
+  RL:
+    use_adaptive_approach: false

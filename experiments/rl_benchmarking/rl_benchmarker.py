@@ -1,231 +1,43 @@
-import os
+"""Optional classical-controller deployment comparisons (separate environment)."""
+
 from pathlib import Path
+import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import matplotlib.pyplot as plt
-import wandb
 
+from smallsat_sim.controllers.lqr.controller import LQRController
+from smallsat_sim.envs.vehicles.astrobee_benchmark.env import AstrobeeBenchmarkEnv
+from smallsat_sim.envs.vehicles.astrobee_rl import config as rl_config
+from smallsat_sim.envs.effects.disturbances import DisturbanceList, ConstantForceDisturbance
+from smallsat_sim.planners.oracle.oracle import OraclePlanner
 from smallsat_sim.utils.helpers import (
     get_args,
     calc_attitude_error,
     calc_lateral_tracking_error,
 )
-from smallsat_sim.utils.logger import Logger
-from smallsat_sim.controllers.rl.runners.on_policy_runner import OnPolicyRunner
-from smallsat_sim.envs.astrobee_rl.env import AstrobeeEnvVectorized
-from smallsat_sim.envs.astrobee_benchmark.env import AstrobeeBenchmarkEnv
-from smallsat_sim.envs.disturbances import DisturbanceList, ConstantForceDisturbance
-from smallsat_sim.planners.oracle.oracle_rl import OraclePlannerRL
-from smallsat_sim.planners.oracle.oracle import OraclePlanner
-from smallsat_sim.controllers.rl.controller import RLController
-from smallsat_sim.controllers.nominal_mpc.controller import NominalMPCController
-from smallsat_sim.controllers.lqr.controller import LQRController
-from smallsat_sim.envs.astrobee_rl.cfg import config as rl_config
+
+FAULT_ONSET_STEP = 100
 
 
-class Benchmarker(object):
-    """
-    Helper functions to train and test the RL controller.
-    NOTE: scripts using Benchmarker must be run in headless mode.
-    """
-
-    def __init__(self, run_name: str = "default") -> None:
-        """
-        Initialize the Benchmarking class.
-        """
-        # Get arguments for script execution
+class Benchmarker:
+    def __init__(self, run_name="default"):
         self.args = get_args()
-
-        # Run name for logging
         self.run_name = run_name
         self._repo_root = Path(__file__).resolve().parents[2]
-
-    def train_and_evaluate(
-        self,
-        train_with_failures: bool,
-        use_pretrained: bool,
-        use_adaptive_approach: bool,
-        am_architecture: str | None = None,
-        phase: int = 2,
-        pretrain_only: bool = False,
-    ) -> None:
-        """
-        Train and evaluate the RL controller.
-        """
-        # Create environment
-        env = AstrobeeEnvVectorized(
-            args=self.args,
-            run_name=self.run_name,
-            train_with_failures=train_with_failures,
-            use_pretrained=use_pretrained,
-            use_adaptive_approach=use_adaptive_approach,
-            am_architecture=am_architecture,
-        )
-
-        # Create planner
-        planner = OraclePlannerRL(env, radius=0.0)
-
-        # Create runner
-        runner = OnPolicyRunner(env, planner)
-
-        if use_pretrained:
-            # Pretraining
-            runner.pretrain()
-
-        if not pretrain_only:
-            # Learning
-            runner.learn()
-
-            # Adaptation module training
-            if use_adaptive_approach and phase == 2:
-                runner.train_adaptation_module_on_policy()
-
-            # Evaluation
-            runner.evaluate(phase=phase)
-
-        # Save log if logging is enabled
-        if self.args.log:
-            env.logger.save_log()
-
-        if env.use_wandb and wandb.run is not None:
-            wandb.finish()
-
-    def deploy_and_test(
-        self,
-        train_with_failures: bool,
-        use_pretrained: bool,
-        use_adaptive_approach: bool,
-        am_architecture: str | None = None,
-        phase: int = 2,
-        ckpt_name: str | None = None,
-        test_pd: bool = False,
-    ) -> None:
-        """
-        Deploy and test the RL controller.
-        """
-        rl_cfg = rl_config.EnvConfig().control.RL
-
-        def _save_video(stage_name: str) -> None:
-            if self.args.video:
-                video_dir = os.path.join(
-                    str(self._repo_root),
-                    "experiments",
-                    "rl_results",
-                    self.run_name,
-                    stage_name,
-                    "videos",
-                )
-                output_name = (
-                    f"{self.run_name}_{stage_name}_run{env.run_id:04d}"
-                )
-                env.get_sim_rendering(output_name, output_dir=video_dir)
-
-        # Create environment
-        env = AstrobeeEnvVectorized(
-            args=self.args,
-            run_name=self.run_name,
-            init_pos=jnp.array(rl_cfg.deployment_init_pos, dtype=jnp.float32),
-            max_start_offset=rl_cfg.deployment_max_start_offset,
-            train_with_failures=train_with_failures,
-            use_pretrained=use_pretrained,
-            use_adaptive_approach=use_adaptive_approach,
-            am_architecture=am_architecture,
-        )
-
-        # Create planner
-        planner = OraclePlannerRL(
-            env,
-            radius=rl_cfg.deployment_radius,
-            spacing=rl_cfg.deployment_spacing,
-        )
-
-        # Create controller
-        ctrl = RLController(env, planner, ckpt_name=ckpt_name)
-
-        # Simulation loop
-        ctrl.control(phase=phase, test_pd=test_pd)
-        _save_video("deployment")
-
-        # Test stuck off thrusters
-        ctrl.control(
-            stage="stuck_off_deployment",
-            phase=phase,
-            test_pd=test_pd,
-            perturbation_distribution=jnp.array([1.0, 0.0, 0.0, 0.0, 0.0]),
-        )
-        _save_video("stuck_off_deployment")
-
-        # Test stuck on thrusters
-        ctrl.control(
-            stage="stuck_on_deployment",
-            phase=phase,
-            test_pd=test_pd,
-            perturbation_distribution=jnp.array([0.0, 1.0, 0.0, 0.0, 0.0]),
-        )
-        _save_video("stuck_on_deployment")
-
-        # Test faulty valve
-        ctrl.control(
-            stage="faulty_valve_deployment",
-            phase=phase,
-            test_pd=test_pd,
-            perturbation_distribution=jnp.array([0.0, 0.0, 1.0, 0.0, 0.0]),
-        )
-        _save_video("faulty_valve_deployment")
-
-        # Test saturated thrust
-        ctrl.control(
-            stage="saturated_thrust_deployment",
-            phase=phase,
-            test_pd=test_pd,
-            perturbation_distribution=jnp.array([0.0, 0.0, 0.0, 1.0, 0.0]),
-        )
-        _save_video("saturated_thrust_deployment")
-
-        # Test thrust instability
-        ctrl.control(
-            stage="thrust_instability_deployment",
-            phase=phase,
-            test_pd=test_pd,
-            perturbation_distribution=jnp.array([0.0, 0.0, 0.0, 0.0, 1.0]),
-        )
-        _save_video("thrust_instability_deployment")
-
-        # Test constant force disturbances
-        ctrl.control(
-            stage="constant_force_disturbances_deployment",
-            phase=phase,
-            test_pd=test_pd,
-            apply_disturbances=True,
-        )
-        _save_video("constant_force_disturbances_deployment")
-
-        # Save log if logging is enabled
-        if self.args.log:
-            env.logger.save_log()
 
     def deploy_and_test_classic(self, controller_type: str) -> None:
         """
         Deploy and test classic controllers (Nominal MPC, LQR) on the oracle trajectory.
         """
-        rl_cfg = rl_config.EnvConfig().control.RL
-
-        def _resolve_deployment_len() -> int | None:
-            if hasattr(env.env_cfg.control, "RL"):
-                return env.env_cfg.control.RL.deployment_len
-            try:
-                from smallsat_sim.envs.astrobee_rl.cfg import config as rl_config
-            except ImportError:
-                return None
-            return rl_config.EnvConfig().control.RL.deployment_len
+        rl_cfg = rl_config.resolve_config().training
 
         def _seed_for_stage(stage_name: str) -> jax.random.PRNGKey:
             base_seed = int(getattr(env.env_cfg.sim, "seed", 0))
             stage_idx = stages.index(stage_name)
             seed = base_seed + stage_idx
-            np.random.seed(seed)
+            env.np_rng.seed(seed)
             return jax.random.PRNGKey(seed)
 
         def _save_video(env, stage_name: str) -> None:
@@ -248,9 +60,7 @@ class Benchmarker(object):
             tracking_error = float(
                 calc_lateral_tracking_error(obs=obs, planner=planner)
             )
-            angle_error = float(
-                calc_attitude_error(np.array([1, 0, 0, 0]), obs[3:7])
-            )
+            angle_error = float(calc_attitude_error(np.array([1, 0, 0, 0]), obs[3:7]))
             env.logger.log(
                 env.run_id,
                 float(env.data.time),
@@ -292,9 +102,7 @@ class Benchmarker(object):
                 )
 
         if controller_type not in {"nominal_mpc", "lqr"}:
-            raise ValueError(
-                "controller_type must be one of: 'nominal_mpc', 'lqr'."
-            )
+            raise ValueError("controller_type must be one of: 'nominal_mpc', 'lqr'.")
 
         # Create environment
         env = AstrobeeBenchmarkEnv(args=self.args)
@@ -311,6 +119,8 @@ class Benchmarker(object):
 
         # Create controller
         if controller_type == "nominal_mpc":
+            from smallsat_sim.controllers.nominal_mpc.controller import NominalMPCController
+
             ctrl = NominalMPCController(env, planner)
         else:
             # Benchmark override: use MPC-style costs so LQR actually tracks in nominal runs.
@@ -345,15 +155,16 @@ class Benchmarker(object):
             )
 
             step = 0
-            perturbation_applied = False
-            max_steps = _resolve_deployment_len()
+            max_steps = rl_cfg.deployment_len
+            # Stop at the simulation time limit or configured control-step limit.
             while env.data.time <= env.env_cfg.sim.max_sim_time:
                 if max_steps is not None and step >= int(max_steps):
                     break
-                if step == 100 and not perturbation_applied:
+                # Allow nominal tracking before introducing the stage fault.
+                if step == FAULT_ONSET_STEP:
                     _apply_stage_perturbation(env, stage_name, float(env.data.time))
-                    perturbation_applied = True
 
+                # Advance one control step and capture requested video and metrics.
                 ctrl_input = ctrl.get_control_input(env)
                 env.step(input=ctrl_input)
                 if self.args.video:

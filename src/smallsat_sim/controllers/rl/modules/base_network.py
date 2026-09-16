@@ -1,37 +1,26 @@
-from collections.abc import Sequence
-import jax.numpy as jnp
+"""Shared neural-network helpers for RL modules."""
+
 from flax import nnx
 
-from smallsat_sim.controllers.rl.modules.mlp import mlp
+from .mlp import mlp
+
+
+def normalize_hidden_sizes(hidden_sizes):
+    sizes = [hidden_sizes] if isinstance(hidden_sizes, int) else list(hidden_sizes)
+    if any(width <= 0 for width in sizes):
+        raise ValueError("Hidden layer widths must be positive")
+    return sizes
 
 
 class Critic(nnx.Module):
-    """
-    The network used by the value function.
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        hidden_sizes: Sequence[int],
-        activation,
-        res_dim: int,
-    ) -> None:
-        super().__init__()
-        self.obs_dim = obs_dim
-        if isinstance(hidden_sizes, int):
-            hidden_layer_sizes = [hidden_sizes]
-        else:
-            hidden_layer_sizes = list(hidden_sizes)
-        layer_sizes = [obs_dim + res_dim] + hidden_layer_sizes + [1]
+    def __init__(self, obs_dim, hidden_sizes, activation, res_dim, *, rngs):
         self.v_net = mlp(
-            layer_sizes,
+            [obs_dim + res_dim, *normalize_hidden_sizes(hidden_sizes), 1],
             activation,
-            last_layer_std=1.0,
+            rngs=rngs,
         )
 
-    def forward(self, obs_residuals: jnp.ndarray):
-        """
-        Return the value estimates for given observations.
-        """
-        return jnp.squeeze(self.v_net(obs_residuals), -1)
+    def forward(self, observations):
+        return self.v_net(observations)[..., 0]
+
+    __call__ = forward

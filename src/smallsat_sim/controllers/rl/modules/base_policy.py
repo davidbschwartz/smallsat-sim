@@ -1,139 +1,116 @@
-from collections.abc import Sequence
-import jax
-import jax.numpy as jnp
+"""Diagonal Gaussian policy with a sigmoid transform to physical thrust bounds.
+
+Training stores the Gaussian (pre-squash) sample. Never recover a PPO training
+sample by inverting a rounded/saturated physical command.
+"""
+
+from typing import NamedTuple
+
 from flax import nnx
 import distrax
+import jax
+import jax.numpy as jnp
+import numpy as np
 
-from smallsat_sim.controllers.rl.modules.mlp import mlp
+from .base_network import normalize_hidden_sizes
+from .mlp import mlp
+
+
+class PolicySample(NamedTuple):
+    actions: jax.Array
+    latent_actions: jax.Array
+    logp: jax.Array
 
 
 class Actor(nnx.Module):
-    """
-    The policy network. Inspired from https://spinningup.openai.com/en/latest/algorithms/vpg.html.
-    """
-
     def __init__(
         self,
-        obs_dim: int,
-        act_dim: int,
-        hidden_sizes: Sequence[int],
+        obs_dim,
+        act_dim,
+        hidden_sizes,
         activation,
-        res_dim: int,
-        act_low: jnp.ndarray,
-        act_high: jnp.ndarray,
-        log_std_min: float | None = None,
-    ) -> None:
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-        self._eps = 1e-6
-        self.act_low = jnp.asarray(act_low)
-        self.act_high = jnp.asarray(act_high)
+        res_dim,
+        act_low,
+        act_high,
+        initial_log_std=-0.5,
+        log_std_min=None,
+        *,
+        rngs,
+    ):
+        low, high = np.asarray(act_low), np.asarray(act_high)
+        if low.shape != (act_dim,) or high.shape != (act_dim,):
+            raise ValueError("Action bounds must have shape (act_dim,)")
+        if not np.all(np.isfinite(low) & np.isfinite(high) & (high > low)):
+            raise ValueError(
+                "Action bounds must be finite with strictly positive width"
+            )
+        self.obs_dim, self.act_dim, self.res_dim = obs_dim, act_dim, res_dim
+        self.act_low, self.act_high = jnp.asarray(low), jnp.asarray(high)
         self.act_range = self.act_high - self.act_low
-        self._range_mask = (self.act_range > 0).astype(jnp.float32)
-        self._range_safe = jnp.where(
-            self._range_mask > 0, self.act_range, jnp.ones_like(self.act_range)
+        self.log_std = nnx.Param(
+            jnp.full((act_dim,), initial_log_std, dtype=jnp.float32)
         )
-        self._log_range_safe = jnp.log(self._range_safe)
-        log_std = -0.5 * jnp.ones(act_dim)
-        self.log_std = nnx.Param(log_std)
-        if log_std_min is None:
-            self.log_std_min = None
-        else:
-            self.log_std_min = jnp.asarray(log_std_min, dtype=jnp.float32)
-        if isinstance(hidden_sizes, int):
-            hidden_layer_sizes = [hidden_sizes]
-        else:
-            hidden_layer_sizes = list(hidden_sizes)
-        layer_sizes = [obs_dim + res_dim] + hidden_layer_sizes + [act_dim]
+        self.log_std_min = log_std_min
         self.mu_net = mlp(
-            layer_sizes,
+            [obs_dim + res_dim, *normalize_hidden_sizes(hidden_sizes), act_dim],
             activation,
-            output_activation=None,
             last_layer_std=0.01,
+            rngs=rngs,
         )
 
-    def _distribution(self, obs_residuals: jnp.ndarray):
-        """
-        Return a Gaussian distribution over actions given observations.
-        """
-        mu = self.mu_net(obs_residuals)
+    def distribution_parameters(self, observations):
         log_std = self.log_std.value
         if self.log_std_min is not None:
             log_std = jnp.maximum(log_std, self.log_std_min)
-        std = jnp.exp(log_std)
-        return distrax.MultivariateNormalDiag(mu, std)
+        return self.mu_net(observations), log_std
 
-    def _log_prob_from_dist(
-        self, pi: distrax.MultivariateNormalDiag, actions: jnp.ndarray
-    ):
-        """
-        Return the log-probability of actions under the action distribution.
-        """
-        if self.act_dim == 0:
-            return pi.log_prob(actions)
+    def _distribution(self, observations):
+        mean, log_std = self.distribution_parameters(observations)
+        return distrax.MultivariateNormalDiag(mean, jnp.exp(log_std))
 
-        pre_actions = self._inverse_squash(actions)
-        norm_actions = self._normalize_actions(actions)
-        log_det = self._log_det_jacobian(norm_actions)
-        return pi.log_prob(pre_actions) - log_det
+    def log_prob(self, observations, latent_actions):
+        mean, log_std = self.distribution_parameters(observations)
+        return self._log_prob_diag_gaussian_pre_squash(mean, log_std, latent_actions)
 
-    def forward(
-        self, obs_residuals: jnp.ndarray, actions: jnp.ndarray | None = None
-    ) -> tuple[distrax.MultivariateNormalDiag, jnp.ndarray | None]:
-        """
-        Return action distributions for given observations and the log-likelihood of given actions under those distributions.
-        """
-        pi = self._distribution(obs_residuals)
+    def _log_prob_diag_gaussian_pre_squash(self, mean, log_std, latent):
+        normal = -0.5 * jnp.sum(
+            ((latent - mean) * jnp.exp(-log_std)) ** 2
+            + 2 * log_std
+            + jnp.log(2 * jnp.pi),
+            axis=-1,
+        )
+        jacobian = jnp.sum(
+            jnp.log(self.act_range)
+            + jax.nn.log_sigmoid(latent)
+            + jax.nn.log_sigmoid(-latent),
+            axis=-1,
+        )
+        return normal - jacobian
 
-        if actions is None:
-            logp = None
-        else:
-            logp = jnp.asarray(self._log_prob_from_dist(pi, actions))
+    def sample(self, observations, key):
+        mean, log_std = self.distribution_parameters(observations)
+        latent = mean + jnp.exp(log_std) * jax.random.normal(
+            key, mean.shape, mean.dtype
+        )
+        return PolicySample(
+            self.apply_action_bounds(latent),
+            latent,
+            self._log_prob_diag_gaussian_pre_squash(mean, log_std, latent),
+        )
 
-        return pi, logp
+    def sample_action_and_logp(self, observations, key):
+        sample = self.sample(observations, key)
+        return sample.actions, sample.logp
 
-    def apply_action_bounds(self, pre_actions: jnp.ndarray) -> jnp.ndarray:
-        """
-        Squash pre-activation actions into the valid thruster range.
-        """
-        if self.act_dim == 0:
-            return pre_actions
-        squashed = jax.nn.sigmoid(pre_actions)
-        return self.act_low + self.act_range * squashed
+    def apply_action_bounds(self, latent):
+        return self.act_low + self.act_range * jax.nn.sigmoid(latent)
 
-    def deterministic_action(self, obs_residuals: jnp.ndarray) -> jnp.ndarray:
-        """
-        Return the mean action squashed into the thruster range.
-        """
-        return self.apply_action_bounds(self.mu_net(obs_residuals))
+    def deterministic_action(self, observations):
+        return self.apply_action_bounds(self.mu_net(observations))
 
-    def _normalize_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
-        """
-        Normalize bounded actions to (0, 1) for change-of-variables calculations.
-        """
-        if self.act_dim == 0:
-            return actions
-        norm = (actions - self.act_low) / self._range_safe
-        norm = jnp.where(self._range_mask > 0, norm, 0.5)
-        return jnp.clip(norm, self._eps, 1.0 - self._eps)
-
-    def _inverse_squash(self, actions: jnp.ndarray) -> jnp.ndarray:
-        """
-        Map bounded actions back to the unconstrained space.
-        """
-        if self.act_dim == 0:
-            return actions
-        norm = self._normalize_actions(actions)
-        return jnp.log(norm) - jnp.log1p(-norm)
-
-    def _log_det_jacobian(self, norm_actions: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute log-determinant of the sigmoid+scaling Jacobian for log-prob correction.
-        """
-        if self.act_dim == 0:
-            return jnp.zeros(norm_actions.shape[0])
-        log_sigma = jnp.log(norm_actions)
-        log_one_minus = jnp.log1p(-norm_actions)
-        contrib = self._range_mask * (self._log_range_safe + log_sigma + log_one_minus)
-        return jnp.sum(contrib, axis=-1)
+    def forward(self, observations, latent_actions=None):
+        return self._distribution(observations), (
+            None
+            if latent_actions is None
+            else self.log_prob(observations, latent_actions)
+        )

@@ -1,13 +1,6 @@
+"""Package paths and constants for smallsat_sim."""
+
 import os
-
-try:
-    import torch
-except ImportError:
-    torch = None
-else:
-    if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.05, device=0)
-
 
 # Absolute path to root directoy to smallsat-sim folder
 SMALLSAT_SIM_ROOT_DIR = os.path.dirname(os.path.realpath(__file__))

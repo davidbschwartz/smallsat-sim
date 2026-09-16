@@ -1,12 +1,21 @@
+"""Mission planner primitives for time-parameterized trajectories."""
+
 from smallsat_sim.planners.base_planner import BasePlanner
 
 import numpy as np
-import mujoco
 import time
+from smallsat_sim.planners.validation import positive_finite
 
 from abc import abstractmethod
 from typing import Optional
+from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Slerp, Rotation as R
+
+
+
+def euler_to_quaternion(angles):
+    """Convert xyz Euler angles in degrees to scalar-first quaternions."""
+    return R.from_euler("xyz", angles, degrees=True).as_quat(scalar_first=True)
 
 
 class Waypoint:
@@ -28,8 +37,7 @@ class Waypoint:
 
         # Attitude (convert to quaternion if given as Euler angles in degrees)
         if attitude.shape[0] == 3:
-            euler_angles = np.radians(attitude)
-            quat = R.from_euler("xyz", euler_angles).as_quat(scalar_first=True)
+            quat = euler_to_quaternion(attitude)
             self._attitude = quat
         else:
             self._attitude = attitude
@@ -127,13 +135,19 @@ class Line(Segment):
     """
 
     def calc_length(self) -> float:
-        return np.linalg.norm(self.end_point.position - self.start_point.position)
+        length = float(np.linalg.norm(self.end_point.position - self.start_point.position))
+        if not np.isfinite(length) or length <= 0:
+            raise ValueError("Line endpoints must have a finite, nonzero separation")
+        return length
 
     def interpolate(
         self, arc_length: float, interpolation_mode: str = "Linear"
-    ) -> np.ndarray:
-        # Calculate interpolation factor
+    ) -> IntermediateWaypoint:
+        # Allow small numerical overshoots, consistently for position and attitude.
         frac_length = arc_length / self.length
+        if not np.isfinite(frac_length) or not -1e-3 <= frac_length <= 1 + 1e-3:
+            raise ValueError("arc_length must lie within the line segment")
+        frac_length = float(np.clip(frac_length, 0.0, 1.0))
 
         # Interpolate position
         interpolated_position = (
@@ -143,24 +157,6 @@ class Line(Segment):
 
         # Interpolate attitude
         if interpolation_mode == "Linear":
-            # Check if frac_length is out of bound due to numerical errors
-            # Otherwise throw an exception
-            eps = 1e-3
-            if frac_length > 1.0:
-                if frac_length < 1.0 + eps:
-                    frac_length = 1.0
-                else:
-                    print(
-                        f"Normalized arclength is out of bounds [0,1] with value {frac_length}"
-                    )
-            elif frac_length < 0.0:
-                if frac_length > -eps:
-                    frac_length = 0.0
-                else:
-                    print(
-                        f"Normalized arclength is out of bounds [0,1] with value {frac_length}"
-                    )
-
             # Create slerp object
             slerp = Slerp(
                 times=[0, 1],
@@ -315,10 +311,9 @@ class Trajectory:
         """
         segment_index = self._get_segment_index(arc_length)
 
-        if segment_index == 0:
-            return np.array([0.0])
-        else:
-            return np.array([self.intervals[segment_index - 1]])
+        lap_start = np.floor(arc_length / self.length) * self.length
+        local_start = 0. if segment_index == 0 else self.intervals[segment_index - 1]
+        return np.array([lap_start + local_start])
 
     def _get_tangent_segment(self, arc_length: float) -> np.ndarray:
         """
@@ -352,9 +347,15 @@ class MissionPlanner(BasePlanner):
     ) -> None:
         super().__init__(env)
 
+        positive_finite("spacing", spacing)
+        positive_finite("clearance_dist", clearance_dist)
+        if planner_mode not in {"Waypoint Tracking", "Intermediate Waypoint Tracking"}:
+            raise ValueError(f"Unsupported planner_mode: {planner_mode!r}")
+
         # Initialize paramaters
         self.spacing = spacing
         self.clearance_dist = clearance_dist
+        self._env = env
 
         # Load the waypoints
         self._load_waypoints()
@@ -402,7 +403,19 @@ class MissionPlanner(BasePlanner):
             # Initialize the timer clearance boolean
             self.timer_started = False
 
+        if planner_mode == "Waypoint Tracking":
+            self.visualize([wp.position for wp in self.waypoints], size=(.05, 0, 0))
         self._visualize_collision_constraints()
+
+    def reset(self, obs=None):
+        """Restart tracking, optionally aligned to a new observation."""
+        position = np.asarray(obs[:3]).reshape(3) if obs is not None else self.waypoints[0].position
+        self.idx_reference_point = (
+            self._closest_intermediate_index(position)
+            if hasattr(self, "_intermediate_reference") else self._closest_waypoint_index(position)
+        )
+        self.timer_started = False
+        self.start_time = 0.0
 
     def _load_waypoints(self) -> None:
         """
@@ -535,6 +548,13 @@ class MissionPlanner(BasePlanner):
         """
         return self._get_reference_wp_tracking(obs)
 
+    def _simulation_time(self) -> float:
+        data = getattr(self._env, "data", None)
+        if data is not None and hasattr(data, "time"):
+            return float(data.time)
+        # Non-simulation environments may not expose a simulation clock.
+        return time.monotonic()
+
     def _get_reference_wp_tracking(
         self, obs: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -551,25 +571,16 @@ class MissionPlanner(BasePlanner):
         # If smallsat enters clearance dist -> start timer
         # Once it's been inside clearance dist for certain time,
         # switch reference to next waypoint
+        now = self._simulation_time()
         if dist < self.clearance_dist:
-            if not self.timer_started:
+            if not self.timer_started or now < self.start_time:
                 self.timer_started = True
-                self.start_time = time.time()
-            elif time.time() - self.start_time > 5:
+                self.start_time = now
+            elif now - self.start_time >= 5:
                 self.idx_reference_point += 1
                 self.timer_started = False
-
-        # Visualize in viewer (if available)
-        self.visualize(
-            [waypoint.position for waypoint in self.waypoints],
-            size=[0.05, 0, 0],
-        )
-
-        # Visualize the waypoints and corridor in the saved video
-        self._visualize_renderer(
-            [waypoint.position for waypoint in self.waypoints],
-            size=[0.05, 0, 0],
-        )
+        else:
+            self.timer_started = False
 
         reference = self.waypoints[self.idx_reference_point % len(self.waypoints)]
 
@@ -592,18 +603,6 @@ class MissionPlanner(BasePlanner):
         if dist < self.clearance_dist:
             self.idx_reference_point += 1
 
-        # Visualize in viewer (if available)
-        self.visualize(
-            [waypoint.position for waypoint in self._intermediate_reference],
-            size=[0.05, 0, 0],
-        )
-
-        # Visualize the waypoints and corridor in the saved video
-        self._visualize_renderer(
-            [waypoint.position for waypoint in self._intermediate_reference],
-            size=[0.05, 0, 0],
-        )
-
         reference = self._intermediate_reference[
             self.idx_reference_point % len(self._intermediate_reference)
         ]
@@ -619,72 +618,27 @@ class MissionPlanner(BasePlanner):
         """
         self._intermediate_reference = []
         for i, segment in enumerate(self.trajectory.reference):
-            # Extract initial arc_length of each interval
-            arc_length = self.trajectory.intervals[i - 1] if i > 0 else 0
-
-            # Calculate the number of points in the segment
-            num_points_in_segment = int(segment.length / self.spacing)
-
-            # Calculate the actual spacing
-            spacing = segment.length / (1e-5 + num_points_in_segment)
-
-            # Append the Waypoint at the start
+            num_intervals = max(1, int(np.ceil(segment.length / self.spacing)))
             self._intermediate_reference.append(self.waypoints[i])
-
-            # Append Intermediate Waypoints
             self._intermediate_reference.extend(
-                self.trajectory.get_intermediate_reference(arc_length + j * spacing)
-                for j in range(1, num_points_in_segment)
+                segment.interpolate(segment.length * j / num_intervals)
+                for j in range(1, num_intervals)
             )
 
-        if True:
-            self.visualize(
-                [waypoint.position for waypoint in self._intermediate_reference],
-                size=[0.05, 0, 0],
-            )
+        self.visualize(
+            [waypoint.position for waypoint in self._intermediate_reference],
+            size=[0.05, 0, 0],
+        )
 
     def _visualize_collision_constraints(self) -> None:
-        """
-        Visualizes the collision constraints around the mission trajectory
-        """
-
-        if hasattr(self, "viewer") and self.viewer is not None:
-
-            collision_radius = 1.0
-
-            for i, segment in enumerate(self.trajectory.reference):
-                # Increment ngeom
-                self.viewer.user_scn.ngeom += 1
-
-                # Extract points
-                start_point = segment.start_point.position
-                end_point = segment.end_point.position
-
-                # Initialize geometry
-                mujoco.mjv_initGeom(
-                    self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom - 1],
-                    type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-                    size=np.zeros(3),
-                    pos=np.zeros(3),
-                    mat=np.zeros(9),
-                    rgba=np.array([0.69, 0.4, 1, 0.0]),
-                )
-
-                # Make the connector geometry
-                mujoco.mjv_connector(
-                    self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom - 1],
-                    mujoco.mjtGeom.mjGEOM_CAPSULE,
-                    float(collision_radius),
-                    [
-                        float(start_point[0]),
-                        float(start_point[1]),
-                        float(start_point[2]),
-                    ],
-                    [float(end_point[0]), float(end_point[1]), float(end_point[2])],
-                )
-
-        else:
-            return
+        """Submit trajectory clearance capsules for all enabled outputs."""
+        if self.visualization is not None:
+            capsules = [
+                (segment.start_point.position, segment.end_point.position,
+                 1.0, (0.69, 0.4, 1, 0.1))
+                for segment in self.trajectory.reference
+            ]
+            self.visualization.set_overlay("clearance", [], capsules=capsules)
 
     def _create_trajectory(self) -> None:
         """
@@ -729,94 +683,25 @@ class MissionPlanner(BasePlanner):
     def distance_to_closest_waypoint(self, point: np.ndarray) -> float:
         """
         Calculates the distance from the given point to the closest Waypoint.
-        Returns the distance and the index of the closest Waypoint.
+        Returns the distance to the closest Waypoint.
         """
         min_distance = float("inf")
-        closest_waypoint_index = -1
 
-        for idx, waypoint in enumerate(self.waypoints):
+        for waypoint in self.waypoints:
             distance = np.linalg.norm(point - waypoint.position)
             if distance < min_distance:
                 min_distance = distance
-                closest_waypoint_index = idx
 
         return min_distance
 
-    def _visualize_renderer(
-        self, points: list[np.ndarray], color=[1, 0, 0, 2], size=[0.05, 0, 0]
-    ) -> None:
-        """
-        Visualizes reference points in the MuJoCo renderer.
-        """
-        if (
-            self.data.time >= self.env_cfg.renderer.start_recording
-            and self.data.time <= self.env_cfg.renderer.end_recording
-        ):
-            self.renderer.scene.ngeom = 0
-
-            # Update the renderer scene
-            self.renderer.update_scene(self.data, self.cam)
-
-            # # Iterate over all points which need to be visualized in renderer
-            for point in points:
-                self.renderer.scene.ngeom += 1
-                x = point[0]
-                y = point[1]
-                z = point[2]
-                mujoco.mjv_initGeom(
-                    self.renderer.scene.geoms[self.renderer.scene.ngeom - 1],
-                    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=size,
-                    pos=np.array([x, y, z]),
-                    mat=np.eye(3).flatten(),
-                    rgba=np.array(color),
-                )
-
-            # Collision constraints
-            collision_radius = 1.0
-            for i, segment in enumerate(self.trajectory.reference):
-                # Increment ngeom
-                self.renderer.scene.ngeom += 1
-
-                # Extract points
-                start_point = segment.start_point.position
-                end_point = segment.end_point.position
-
-                # Initialize geometry
-                mujoco.mjv_initGeom(
-                    self.renderer.scene.geoms[self.renderer.scene.ngeom - 1],
-                    type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-                    size=np.zeros(3),
-                    pos=np.zeros(3),
-                    mat=np.zeros(9),
-                    rgba=np.array([0.69, 0.4, 1, 0.1]),
-                )
-
-                # Make the connector geometry
-                mujoco.mjv_connector(
-                    self.renderer.scene.geoms[self.renderer.scene.ngeom - 1],
-                    mujoco.mjtGeom.mjGEOM_CAPSULE,
-                    float(collision_radius),
-                    [
-                        float(start_point[0]),
-                        float(start_point[1]),
-                        float(start_point[2]),
-                    ],
-                    [float(end_point[0]), float(end_point[1]), float(end_point[2])],
-                )
-
-            # Extract image from renderer and append it for post-processing
-            if not self.is_mpc:
-                sim_img = self.renderer.render().copy()
-                self.frames.append(sim_img)
+    def _visualize_renderer(self, points, color=(1, 0, 0, 1), size=(.05, 0, 0)):
+        self.visualize(points, color=color, size=size)
+        self._visualize_collision_constraints()
 
 
 """
 Cubic splines implementation
 """
-import numpy as np
-from scipy.interpolate import CubicSpline
-
 
 class MissionPlannerCubicSpline(MissionPlanner):
     """
@@ -829,11 +714,18 @@ class MissionPlannerCubicSpline(MissionPlanner):
         spacing=1.0,
     ) -> None:
 
-        # Initialize parameters
+        BasePlanner.__init__(self, env)
+        positive_finite("spacing", spacing)
         self.spacing = spacing
+        self.clearance_dist = 0.1
+        self._env = env
 
         # Load the waypoints
         self._load_waypoints_CS()
+        self.waypoints = [
+            Waypoint(np.asarray(position), attitude)
+            for position, attitude in zip(self.positions, self.attitudes)
+        ]
 
         # Create the trajectory
         self._create_trajectory_CS()
@@ -841,7 +733,23 @@ class MissionPlannerCubicSpline(MissionPlanner):
         # Generate visualization waypoints
         self.visualization_points = self.get_visualization_points(spacing=0.1)
 
-        super().__init__(env)
+        self._intermediate_reference = self.get_visualization_points(spacing=spacing)[:-1]
+        initial_obs = env.get_obs() if hasattr(env, "get_obs") else getattr(env, "obs", None)
+        initial_position = (
+            np.asarray(initial_obs[:3]).reshape(3)
+            if initial_obs is not None else np.asarray(self.positions[0])
+        )
+        self.idx_reference_point = self._closest_intermediate_index(initial_position)
+        self.visualize([wp.position for wp in self.visualization_points], size=(.05, 0, 0))
+
+    def get_reference(self, obs):
+        return self._get_reference_intermediate_wp_tracking(obs)
+
+    def _visualize_renderer(self, points, color=(1, 0, 0, 1), size=(.05, 0, 0)):
+        self.visualize(points, color=color, size=size)
+
+    def closest_point_on_trajectory(self, point):
+        return self.closest_point_on_trajectory_CS(point)
 
     def _load_waypoints_CS(self) -> None:
         """
@@ -902,11 +810,7 @@ class MissionPlannerCubicSpline(MissionPlanner):
             [0, -45, 90],  # Point 24
         ]
 
-        # Convert attitudes from Euler angles (degrees) to quaternions
-        # Assuming Euler angles are in ZYX order and scalar_first=True
-        self.attitudes = R.from_euler("ZYX", attitudes, degrees=True).as_quat()
-        # Adjust to scalar_first format [w, x, y, z]
-        self.attitudes = self.attitudes[:, [3, 0, 1, 2]]  # Reorder to [w, x, y, z]
+        self.attitudes = euler_to_quaternion(attitudes)
 
     def _create_trajectory_CS(self) -> None:
         """
@@ -1032,7 +936,6 @@ class MissionPlannerCubicSpline(MissionPlanner):
         # Get the start and end attitudes and their arc lengths
         s0 = self.s_attitudes[idx]
         s1 = self.s_attitudes[idx + 1]
-        t = (s - s0) / (s1 - s0) if s1 > s0 else 0.0  # Avoid division by zero
 
         # Reorder quaternions to [x, y, z, w] format
         attitude1_xyzw = self.interpolated_attitudes[idx][[1, 2, 3, 0]]
@@ -1117,33 +1020,27 @@ class MissionPlannerCubicSpline(MissionPlanner):
             closest_point (np.ndarray): The closest point on the spline.
             s_closest (float): The arc length corresponding to the closest point.
         """
-        from scipy.optimize import minimize_scalar
 
-        # Objective function: squared distance between spline point at s and the given point
-        def objective(s):
-            s = s % self.total_length  # Wrap around the total length
-            x = self.x_spline(s)
-            y = self.y_spline(s)
-            z = self.z_spline(s)
-            spline_point = np.array([x, y, z])
-            return np.sum((spline_point - point) ** 2)
-
-        # Perform the minimization over s in the interval [0, total_length]
-        res = minimize_scalar(
-            objective,
-            bounds=(0, self.total_length),
-            method="bounded",
-            options={"xatol": 1e-8},
+        point = np.asarray(point, dtype=float).reshape(3)
+        # On each cubic interval, squared distance has degree six. Its
+        # derivative's real roots and interval endpoints contain every minimum.
+        candidates = list(self.x_spline.x)
+        for i, left in enumerate(self.x_spline.x[:-1]):
+            width = self.x_spline.x[i + 1] - left
+            derivative = np.zeros(6)
+            for axis, spline in enumerate((self.x_spline, self.y_spline, self.z_spline)):
+                coefficients = spline.c[:, i].copy()
+                coefficients[-1] -= point[axis]
+                derivative = np.polyadd(
+                    derivative, np.polymul(coefficients, np.polyder(coefficients))
+                )
+            for root in np.roots(np.trim_zeros(derivative, "f")):
+                if abs(root.imag) < 1e-8 and 0 <= root.real <= width:
+                    candidates.append(left + root.real)
+        parameters = np.asarray(candidates)
+        positions = np.stack(
+            [spline(parameters) for spline in (self.x_spline, self.y_spline, self.z_spline)],
+            axis=-1,
         )
-
-        if res.success:
-            s_closest = res.x % self.total_length
-            x_closest = self.x_spline(s_closest)
-            y_closest = self.y_spline(s_closest)
-            z_closest = self.z_spline(s_closest)
-            closest_point = np.array([x_closest, y_closest, z_closest])
-            return closest_point, s_closest
-        else:
-            raise RuntimeError(
-                "Optimization failed to find the closest point on the trajectory."
-            )
+        index = np.argmin(np.sum((positions - point) ** 2, axis=1))
+        return positions[index], float(parameters[index] % self.total_length)

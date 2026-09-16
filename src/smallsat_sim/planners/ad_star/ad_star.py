@@ -1,362 +1,228 @@
-import numpy as np
-from smallsat_sim.planners.ad_star import utils
-from smallsat_sim.planners.base_planner import BasePlanner
+"""Anytime backward grid search with explicit scene-snapshot replanning.
+
+AD* consistency updates refine an inflated-heuristic solution to epsilon=1.
+Scene changes trigger a fresh graph search; obstacle motion is not predicted.
+"""
+
 import heapq
-import time
 import threading
-import mujoco
+import numpy as np
+
+from smallsat_sim.planners.base_planner import BasePlanner
+from smallsat_sim.planners.clearance import ClearanceScene
+from smallsat_sim.planners.validation import positive_finite
+
+
+class NoPathError(RuntimeError):
+    """No collision-free reference is available; callers must stop the vehicle."""
 
 
 class ADStarPlanner(BasePlanner):
-    """
-    This class implements the Anytime Dynamic A* (AD*) path planning algorithm.
-    It is based on:
-    "Maxim Likhachev, David Ferguson, Geoff Gordon, Anthony Stentz, and Sebastian Thrun. (2005)
-    “Anytime Dynamic A*: An Anytime, Replanning Algorithm.” In Proc. Int. Conf. Automated Planning and Scheduling, 15. 
-    https://aaai.org/papers/icaps-05-027-anytime-dynamic-a-an-anytime-replanning-algorithm/."
-
-    @author: Markus H. Iversflaten
-    """
-    def __init__(self, env) -> None:  # Not using env in planner yet
+    def __init__(self, env):
         super().__init__(env)
         self.env = env
-        # Resolution of discrete grid
-        self.resolution = env.env_cfg.planner.resolution
-        # Scaling factor for the heuristic (inflation factor)
-        self.epsilon = env.env_cfg.planner.epsilon
-        self.epsilon_increment = env.env_cfg.planner.epsilon_increment
-        self.epsilon_decrement = env.env_cfg.planner.epsilon_decrement
-        self.bounds = env.env_cfg.planner.bounds  # Bounds of the environment
-        # Define the possible directions and their costs (with scale)
-        self.directions = self._scale_directions(env.env_cfg.planner.unit_directions)
-        self.start = env.env_cfg.planner.start_pos  # Initial position of the agent
-        self.goal = env.env_cfg.planner.goal_pos  # Goal position of the agent
+        cfg = env.env_cfg.planner
+        self.resolution = float(cfg.resolution)
+        positive_finite("resolution", self.resolution)
+        self.initial_epsilon = float(cfg.epsilon)
+        if not np.isfinite(self.initial_epsilon) or self.initial_epsilon < 1:
+            raise ValueError("epsilon must be finite and at least one")
+        self.epsilon_decrement = float(cfg.epsilon_decrement)
+        positive_finite("epsilon_decrement", self.epsilon_decrement)
+        self.bounds = np.asarray(cfg.bounds, dtype=float)
+        if self.bounds.shape != (2, 3) or not np.all(np.isfinite(self.bounds)) or np.any(self.bounds[0] > self.bounds[1]):
+            raise ValueError("bounds must be finite ordered 3D corners")
+        self.clearance = float(getattr(cfg, "clearance", 0.02))
+        positive_finite("clearance", self.clearance)
+        self.directions = tuple(tuple(np.asarray(d, dtype=float) * self.resolution)
+                                for d in cfg.unit_directions if np.linalg.norm(d) > 0)
+        if not self.directions:
+            raise ValueError("planner requires nonzero neighbor directions")
+        if any(tuple(-np.asarray(d)) not in self.directions for d in self.directions):
+            raise ValueError("AD* requires symmetric grid directions")
+        self.start = self._endpoint(cfg.start_pos)
+        self.goal = self._endpoint(cfg.goal_pos)
+        self.path = []
+        self.idx_reference_point = 0
+        self._stop = threading.Event()
+        self.planning_thread = None
+        self._error = None
+        self.replan()
+        if not hasattr(env, "_managed_planners"):
+            env._managed_planners = []
+        env._managed_planners.append(self)
 
-        # Inconsistent states "s": Overconsistent: g(s) > rhs(s), Underconsistent: g(s) < rhs(s)
-        self.OPEN = []  # Priority queue of inconsistent states to be expanded
-        self.OPEN_SET = set()  # Set of states that are in the priority queue
-        self.g = {self.start: np.inf, self.goal: np.inf}  # Dictionary of costs from each state to goal
-        self.rhs = {self.start: np.inf, self.goal: 0}  # Dictionary of one-step lookahead costs
+    def _endpoint(self, value):
+        value = np.asarray(value, dtype=float)
+        if value.shape != (3,) or not np.all(np.isfinite(value)) or np.any(value < self.bounds[0]) or np.any(value > self.bounds[1]):
+            raise ValueError("Planner endpoints must lie inside bounds")
+        if not np.allclose(value / self.resolution, np.round(value / self.resolution)):
+            raise ValueError("Planner endpoints must lie on the resolution grid")
+        return tuple(value)
 
-        # Insert the goal into the priority queue to start the expansion
-        heapq.heappush(self.OPEN, (self._key(self.goal), self.goal))
-        self.OPEN_SET.add(self.goal)
-        self.CLOSED = set()  # Set of states that have been expanded
-        self.INCONS = set()  # Set of states that have been expanded and are inconsistent
+    def _key(self, state):
+        g, rhs = self.g.get(state, np.inf), self.rhs.get(state, np.inf)
+        heuristic = np.linalg.norm(np.asarray(state) - self.start)
+        return (rhs + self.epsilon * heuristic, rhs) if g > rhs else (g + heuristic, g)
 
-        # Define the colors for the path visualization
-        self.colors = np.array([
-            [0.0, 1.0, 0.0, 1.0],  # Green
-            [1.0, 0.0, 0.0, 1.0],  # Red
-            [0.0, 0.0, 1.0, 1.0],  # Blue
-            [1.0, 1.0, 0.0, 1.0],  # Yellow
-            [0.0, 1.0, 1.0, 1.0],  # Cyan
-            [1.0, 0.0, 1.0, 1.0],  # Magenta
-            [0.5, 0.5, 0.5, 1.0],  # Gray
-            [1.0, 0.5, 0.0, 1.0],  # Orange
-            [0.5, 0.0, 0.5, 1.0],  # Purple
-            [0.0, 0.5, 0.5, 1.0]   # Teal
-        ])
-        self.num_colors = 10
-        self.color_idx = 0  # Visualize different paths with different colors
+    def _push(self, state):
+        key = self._key(state)
+        self._open_keys[state] = key
+        heapq.heappush(self.OPEN, (key, state))
 
-        self.path = [(0,0,10)]  # List of states that form the optimal path
-        self.idx_reference_point = 0  # Index of the current reference point
-        
-        self.start_planning_thread()
-    
-    def _scale_directions(self, unit_directions) -> dict:
-        """
-        Scale the directions based on the resolution of the grid.
-        """
-        scaled_directions = {
-            tuple(np.array(key) * self.resolution): value * self.resolution
-            for key, value in unit_directions.items()
-        }
-        return scaled_directions
+    def _peek(self):
+        while self.OPEN and self._open_keys.get(self.OPEN[0][1]) != self.OPEN[0][0]:
+            heapq.heappop(self.OPEN)
+        return self.OPEN[0][0] if self.OPEN else (np.inf, np.inf)
 
-    def _remove_from_open(self, s: tuple) -> None:
-        """
-        Reconstructs the heap excluding the specified element.
-        This function is needed in order to remove a specific state from the
-        self.OPEN heap, as the heapq module only supports popping the smallest.
-        """
-        new_heap = []
-        for priority, state in self.OPEN:
-            if state != s:
-                new_heap.append((priority, state))
-        heapq.heapify(new_heap)
-        self.OPEN = new_heap
-        self.OPEN_SET.remove(s)
-
-    def _get_g(self, s: tuple, default: float = np.inf) -> float:
-        """
-        Get the estimated cost of the optimal path from state s to the goal.
-        Return a deafult value if the key does not exist.
-        """
-        return self.g.get(s, default)
-
-    def _get_rhs(self, s: tuple, default: float = np.inf) -> float:
-        """
-        Get the one-step lookahead cost from state s to the goal.
-        Return a deafult value if the key does not exist.
-        """
-        return self.rhs.get(s, np.inf)
-
-    def _key(self, s: tuple) -> tuple[float, float]:
-        """
-        Calculate and return the key for a state based on the current g and rhs values,
-        adjusted by the heuristic scaled by epsilon.
-        Lines 1-4 of the AD* algorithm.
-        """
-        if self._get_g(s) > self._get_rhs(s):
-            return (self._get_rhs(s) + self.epsilon * utils.heuristic(s, self.start), self._get_rhs(s))
-        else:
-            return (self._get_g(s) + utils.heuristic(s, self.start), self._get_g(s))
-
-    def _update_state(self, s: tuple) -> None:
-        """
-        Update the g and rhs values for state s based on its neighbors.
-        """
-        if s not in self.CLOSED:  # Line 5 AD*
-            self.g[s] = np.inf  # Line 6 AD*
-        if s != self.goal:  # Line 7 AD*
-            self.rhs[s] = min([self._cost(s, v) + self._get_g(v) for v in self._get_neighbors(s)])
-
-        if s in self.OPEN_SET:  # Line 8 AD*
-            self._remove_from_open(s)
-
-        if self._get_g(s) != self._get_rhs(s):  # Line 9 AD*
-            if s not in self.CLOSED:  # Line 10 AD*
-                heapq.heappush(self.OPEN, (self._key(s), s))  # Line 11 AD*
-                self.OPEN_SET.add(s)
-            else:
-                self.INCONS.add(s)  # Line 13 AD*
-
-    def _cost(self, u: tuple, v: tuple) -> float:
-        """
-        Calculate the cost of moving from node u to node v based on predefined directions.
-        """
-        return utils.get_distance(u, v)
-
-    def _get_neighbors(self, u: tuple) -> list[tuple]:
-        """
-        Get the neighbors of state u based on the predefined directions.
-        As we are dealing with undirected graphs, the neighbors represent
-        both predecessors (Pred) and successors (Succ) from the paper. 
-        """
-        neighbors = []
+    def _get_neighbors(self, state):
+        result = []
         for direction in self.directions:
-            v = tuple(np.array(u) + np.array(direction))
-            if utils.is_in_bound(np.array(v), self.bounds):
-                if not self._check_collision(u, direction):  # Check for collision
-                    # Add valid neighbor
-                    neighbors.append(v)
-        return neighbors
-    
-    def _check_collision(self, point: np.ndarray, direction) -> tuple[bool, float]:
-        """
-        Checks if a ray from a point in a certain direction 
-        intersects with an obstacle.
-
-        Returns distance to collision or -1 if no intersection.
-        """
-        _ = np.zeros((1, 1), dtype=np.int32)  # Pointer that is needed but unused
-        body_exclude_id = 2  # Exclude the SmallSat body from collision check
-        flg_static = 1  # 0: exclude static geoms, 1: include static geoms
-        group_exclusion = None  # Exclude no geom groups
-        point = np.array(point, dtype=np.float64)  # Cast to float64
-        direction = np.array(direction, dtype=np.float64)  # Cast to float64
-        # Calculate distance to collision
-        dist = mujoco.mj_ray(self.env.model, self.env.data, point, direction,
-                             group_exclusion, flg_static, body_exclude_id, _)
-        
-        # Check if collision is imminent
-        if dist < 0 or dist > self.resolution:
-            return False
-        else:
-            return True
-    
-    def _update_open_keys(self):
-        """
-        Update the keys for all states in the OPEN list with the new epsilon value.
-        """
-        new_open = []
-        while self.OPEN:
-            _, state = heapq.heappop(self.OPEN)
-            new_open.append((self._key(state), state))
-        heapq.heapify(new_open)
-        self.OPEN = new_open
-        self.OPEN_SET = {state for _, state in self.OPEN}  # Update the set as well
-
-    def compute_shortest_path(self) -> None:
-        """
-        Compute the shortest path from the start to the goal.
-        """
-        while self.OPEN and (self.OPEN[0][0] < self._key(self.start) or 
-            self._get_rhs(self.start) != self._get_g(self.start)
-        ):  # Line 14 AD*
-            # Get the state with the smallest key
-            _, current = heapq.heappop(self.OPEN)  # Line 15 AD*
-            if current is None:
-                break
-            # Check for consistency
-            if self._get_g(current) > self._get_rhs(current):  # Line 16 AD*
-                self.g[current] = self.rhs[current]  # Line 17 AD*, make consistent
-                self.CLOSED.add(current)  # Line 18 AD*
-                for s in self._get_neighbors(current):  # Line 19 AD*
-                    self._update_state(s)
-            else:
-                self.g[current] = np.inf  # Line 21 AD*
-                self._update_state(current)  # Part of line 22 (union of neighbors and current)
-                for s in self._get_neighbors(current):  # Line 22 AD*
-                    self._update_state(s)
-
-    def generate_path(self) -> list[tuple]:
-        """
-        Reconstruct (sub)optimal path from start to goal based on g-values.
-        """
-        path = []
-        s = self.start
-        visited = set()
-        i = 0
-
-        while utils.get_distance(s, self.goal) > self.resolution:
-            neighbors = self._get_neighbors(s)
-            if not neighbors:
-                print("No neighbors found.")
-                break
-
-            next_node = None
-            min_cost = np.inf
-            for neighbor in neighbors:
-                if neighbor not in visited:
-                    cost = self._cost(s, neighbor) + self._get_g(neighbor)
-                    if cost < min_cost:
-                        min_cost = cost
-                        next_node = neighbor
-
-            if next_node is None:
-                print("Path reconstruction failed.")
-                return []
-
-            path.append(next_node)
-            s = next_node
-            if i > 100:
-                print("Path reconstruction failed.")
-                return []
-            i += 1
-
-        return path
-    
-    def plan(self):
-        """
-        Main planning loop for the AD* algorithm.
-        """
-        while self.path == []:  # Initial planning
-            self.compute_shortest_path()
-            self.path = self.generate_path()
-            if self.path == []:
-                self.epsilon -= self.epsilon_decrement
+            point = np.asarray(state) + direction
+            point = np.round(point / self.resolution) * self.resolution
+            if np.any(point < self.bounds[0]) or np.any(point > self.bounds[1]):
                 continue
-        prev_path = self.path
+            neighbor = tuple(point)
+            edge = tuple(sorted((state, neighbor)))
+            if edge not in self._edges:
+                self._edges[edge] = self.scene.segment_is_clear(state, neighbor, clearance=self.clearance)
+            if self._edges[edge]:
+                result.append(neighbor)
+        return result
 
-        while True:  # TODO: Keep planner loop ready for replanning
-            if False:  # TODO: if replanning is needed
-                self.epsilon += self.epsilon_increment
-            elif self.epsilon > 1:
-                # Limit epsilon to 1 from below
-                self.epsilon = max(1, self.epsilon - self.epsilon_decrement)
-            # Move states from INCONS to OPEN
-            for s in list(self.INCONS):
-                self.INCONS.remove(s)
-                heapq.heappush(self.OPEN, (self._key(s), s))
-                self.OPEN_SET.add(s)
+    def _update_state(self, state):
+        if state != self.goal:
+            self.rhs[state] = min((np.linalg.norm(np.asarray(state) - other) + self.g.get(other, np.inf)
+                                   for other in self._get_neighbors(state)), default=np.inf)
+        self._open_keys.pop(state, None)
+        if self.g.get(state, np.inf) != self.rhs.get(state, np.inf):
+            if state in self.CLOSED:
+                self.INCONS.add(state)
+            else:
+                self._push(state)
 
-            # Update keys in the OPEN list with the new epsilon value
-            self._update_open_keys()
-
-            self.CLOSED = set()
-            self.compute_shortest_path()
-            self.color_idx += 1
-            self.path = self.generate_path()
-            if self.path == []:  # If failure, keep previous path
-                self.path = prev_path
-            if self.epsilon <= 1:  # Optimal path, break afterwards
-                self.color_idx += 1
-                self.path = self.generate_path()
+    def compute_shortest_path(self):
+        while (self._peek() < self._key(self.start)
+               or self.rhs.get(self.start, np.inf) != self.g.get(self.start, np.inf)):
+            if self._stop.is_set():
+                raise NoPathError("Planning cancelled")
+            if not self.OPEN:
                 break
+            _, state = heapq.heappop(self.OPEN)
+            self._open_keys.pop(state, None)
+            if self.g.get(state, np.inf) > self.rhs.get(state, np.inf):
+                self.g[state] = self.rhs[state]
+                self.CLOSED.add(state)
+            else:
+                self.g[state] = np.inf
+                self._update_state(state)
+            for neighbor in self._get_neighbors(state):
+                self._update_state(neighbor)
+
+    def generate_path(self):
+        if not np.isfinite(self.g.get(self.start, np.inf)):
+            raise NoPathError("No collision-free path to goal")
+        path, visited = [self.start], {self.start}
+        while path[-1] != self.goal:
+            state = path[-1]
+            candidates = [n for n in self._get_neighbors(state) if n not in visited
+                          and np.isfinite(self.g.get(n, np.inf))]
+            if not candidates:
+                raise NoPathError("Path reconstruction failed")
+            next_state = min(candidates, key=lambda n: np.linalg.norm(np.asarray(state) - n) + self.g[n])
+            path.append(next_state)
+            visited.add(next_state)
+        return path
+
+    def replan(self, start=None, goal=None):
+        """Snapshot current obstacles and recompute; never retain a stale failed path."""
+        self.stop_planning_thread()
+        if threading.current_thread() is not self.planning_thread:
+            self._stop.clear()
+        if start is not None:
+            self.start = self._endpoint(start)
+        if goal is not None:
+            self.goal = self._endpoint(goal)
+        self.path, self._error = [], None
+        self.scene = ClearanceScene(self.env)
+        self.quaternion = self.scene.quaternion.copy()
+        self._edges = {}
+        self.epsilon = self.initial_epsilon
+        self.g, self.rhs = {}, {self.goal: 0.}
+        self.OPEN, self._open_keys = [], {}
+        self.CLOSED, self.INCONS = set(), set()
+        if any(self.scene.distance(p) <= self.clearance for p in (self.start, self.goal)):
+            raise NoPathError("Start or goal violates spacecraft clearance")
+        self._push(self.goal)
+        while True:
+            self.compute_shortest_path()
+            path = self.generate_path()
+            if self.epsilon == 1:
+                break
+            self.epsilon = max(1., self.epsilon - self.epsilon_decrement)
+            states = set(self._open_keys) | self.INCONS
+            self.OPEN, self._open_keys = [], {}
+            self.CLOSED, self.INCONS = set(), set()
+            for state in states:
+                self._push(state)
+        self.path = path
+        self.idx_reference_point = min(1, len(path) - 1)
+        self.visualize([np.asarray(p) for p in path])
+        return path
 
     def start_planning_thread(self):
-        self.planning_thread = threading.Thread(target=self.plan)
+        self.stop_planning_thread()
+        self._stop.clear()
+        def run():
+            try:
+                self.replan()
+            except Exception as error:
+                self.path, self._error = [], error
+        self.planning_thread = threading.Thread(target=run, daemon=True)
         self.planning_thread.start()
 
     def stop_planning_thread(self):
-        if self.planning_thread.is_alive():
-            self.planning_thread.join()
+        worker = self.planning_thread
+        if worker is not None and worker is not threading.current_thread():
+            self._stop.set()
+            worker.join()
+            self.planning_thread = None
 
-    def get_reference(self, obs: np.ndarray) -> np.ndarray:
-        dist = np.linalg.norm(
-            obs[0:3]
-            - self.path[
-                self.idx_reference_point % len(self.path)
-            ]
-        )
+    close = stop_planning_thread
 
-        color = self.colors[self.color_idx % self.num_colors]
-        self.visualize([np.array(t) for t in self.path[self.idx_reference_point:]], color=color)
+    def reset(self):
+        return self.replan()
 
-        # If smallsat is closer than the clearance distance, the next reference point is queried
-        if dist < 0.2:
-            self.idx_reference_point += 1
+    def get_reference(self, obs):
+        if not self.path:
+            raise NoPathError("No completed path is available") from self._error
+        position = np.asarray(obs[:3])
+        index = self.idx_reference_point
+        if np.linalg.norm(position - self.path[index]) < min(.2, self.resolution / 2):
+            index = min(index + 1, len(self.path) - 1)
+        target = np.asarray(self.path[index])
+        # Recheck actual pose-to-reference against current obstacles, including
+        # the vehicle's orientation, before returning a commandable waypoint.
+        scene = ClearanceScene(self.env)
+        if not scene.segment_is_clear(position, target, clearance=self.clearance,
+                                      end_quaternion=self.quaternion):
+            self.path = []
+            raise NoPathError("Current route is obstructed; stop and replan")
+        self.idx_reference_point = index
+        return target.reshape(3, 1), self.quaternion.reshape(4, 1)
 
-        return np.array(self.path[
-            self.idx_reference_point % len(self.path)
-        ])
-
-
-if __name__ == "__main__":
-    from smallsat_sim.envs.astrobee.env import AstrobeeEnv
-    from smallsat_sim.utils.helpers import get_args
-    import matplotlib.patches as patches
-    import matplotlib.pyplot as plt
-    args = get_args()
-    # Create a path planner object
-    #env = AstrobeeEnv(args)
-
-
-    planner = ADStarPlanner((0, 0, 0), (9, 9, 9))  # Create planner object
-    
-    print('start')
-    planner.compute_shortest_path()
-    path = planner.generate_path()
-    # Main planning loop
-    while True:
-        previous_path = path
-        if False:  # TODO: if replanning is needed 
-            planner.epsilon += 0.2
-        elif planner.epsilon > 1:
-            planner.epsilon = max(1, planner.epsilon - 1)  # Upper limit epsilon to 1
-        # Move states from INCONS to OPEN
-        for s in list(planner.INCONS):
-            planner.INCONS.remove(s)
-            heapq.heappush(planner.OPEN, (planner._key(s), s))
-            planner.OPEN_SET.add(s)
-        
-        # Update keys in the OPEN list with the new epsilon value
-        planner._update_open_keys()
-
-        planner.CLOSED = set()
-        planner.compute_shortest_path()
-        start = time.time()
-        path = planner.generate_path()
-        print(f"Execution time: {time.time() - start} seconds.")
-        if path != previous_path:
-            print('changed path')
-        print(path)
-        #print(planner.epsilon)
-        if planner.epsilon <= 1:  # Optimal path has been found
-            #path = planner.generate_path()
-            print(len(path))
-            print(path)
-            break
+    def closest_point_on_trajectory(self, point):
+        if not self.path:
+            raise NoPathError("No completed path is available")
+        point = np.asarray(point)
+        closest, best, arc, accumulated = np.asarray(self.path[0]), np.inf, 0., 0.
+        for a, b in zip(self.path[:-1], self.path[1:]):
+            a, b = np.asarray(a), np.asarray(b)
+            length = np.linalg.norm(b - a)
+            t = np.clip(np.dot(point - a, b - a) / length**2, 0., 1.)
+            candidate = a + t * (b - a)
+            distance = np.linalg.norm(candidate - point)
+            if distance < best:
+                closest, best, arc = candidate, distance, accumulated + t * length
+            accumulated += length
+        return closest, arc

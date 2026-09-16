@@ -1,0 +1,46 @@
+# Crew-airlock contact approach with a rate-limited reference.
+experiment: exp4_docking
+spacecraft: astrobee
+controller: mpc
+default_trials: 100
+sensitivity_trials: 50
+steps: 560
+sim_dt: 0.01
+control_decimation: 25
+dock_site: dock_crew_airlock_a
+# Astrobee center at first contact is 0.1624087775917904 m outward
+# from the site; command 5 mm inward to maintain contact.
+dock_surface_offset: -0.1574087775917904
+approach_offset: 1.0
+approach_speed: 0.015
+initial_radius:
+- 0.1
+- 0.5
+initial_z_span: 0.2
+initial_attitude_degrees: 25.0
+initial_linear_velocity: 0.05
+initial_angular_velocity: 0.05
+switch_distance: 0.35
+dock_distance: 0.15
+precontact_position_tolerance: 0.3
+precontact_attitude_tolerance: 0.35
+precontact_deadline: 80.0
+settled_position_tolerance: 0.25
+settled_attitude_tolerance: 0.25
+settled_speed_tolerance: 0.1
+settled_angular_speed_tolerance: 0.05
+settling_hold_seconds: 1.0
+contact_force_bound: 8.0
+post_contact_timeout: 12.0
+settings:
+  default:
+  - 0.02
+  - 1.0
+  soft:
+  - 0.04
+  - 1.0
+  damped:
+  - 0.02
+  - 1.5
+source_branch: demonstration-use-cases
+source_commit: 59c96caa1d813c4c95943996f86f3aea7d6e7a12

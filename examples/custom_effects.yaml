@@ -1,0 +1,30 @@
+# Run from the repository root so examples.custom_effects is importable.
+vehicle: astrobee_rl
+failures: "off"
+log: false
+planner_radius: 0
+overrides:
+  RL:
+    num_envs: 8
+    rollout_backend: freeflyer
+    use_adaptive_approach: false
+    PPO:
+      steps_per_epoch: 16
+      num_minibatches: 1
+    custom_faults:
+      - sample: examples.custom_effects:sample_motor_loss
+        apply: examples.custom_effects:apply_motor_loss
+        version: '1'
+        probability: 0.5
+        start_time: 0.2
+        params:
+          actuator: thruster1
+          minimum: 0.2
+          maximum: 0.8
+    custom_disturbances:
+      - sample: examples.custom_effects:sample_wrench
+        apply: examples.custom_effects:apply_wrench
+        version: '1'
+        start_time: 0.3
+        params:
+          wrench: [0.1, 0, 0, 0, 0, 0]

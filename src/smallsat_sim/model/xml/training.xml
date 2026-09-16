@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='utf-8'?>
+<fragment>
+  <asset>
+    <texture type="2d" name="Canadarm_BaseColor" file="gateway/Canadarm_BaseColor.png" />
+    <material name="Canadarm" texture="Canadarm_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="CrewAirlock_BaseColor" file="gateway/CrewAirlock_BaseColor.png" />
+    <material name="CrewAirlock" texture="CrewAirlock_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="Espirit_Refueller_BaseColor" file="gateway/Espirit_Refueller_BaseColor.png" />
+    <material name="Espirit_Refueller" texture="Espirit_Refueller_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="Habitation_And_Logistics_Outpost_BaseColor" file="gateway/Habitation_And_Logistics_Outpost_BaseColor.png" />
+    <material name="Habitation_And_Logistics_Outpost" texture="Habitation_And_Logistics_Outpost_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="Human_Lander_System_BaseColor" file="gateway/Human_Lander_System_BaseColor.png" />
+    <material name="Human_Lander_System" texture="Human_Lander_System_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="International_Habitation_Module_BaseColor" file="gateway/International_Habitation_Module_BaseColor.png" />
+    <material name="International_Habitation_Module" texture="International_Habitation_Module_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="Logistics_Vehicle_BaseColor" file="gateway/Logistics_Vehicle_BaseColor.png" />
+    <material name="Logistics_Vehicle" texture="Logistics_Vehicle_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="Orion_BaseColor" file="gateway/Orion_BaseColor.png" />
+    <material name="Orion" texture="Orion_BaseColor" specular="0.0" shininess="0.5" />
+    <texture type="2d" name="Power_And_Propulsion_Element_BaseColor" file="gateway/Power_And_Propulsion_Element_BaseColor.png" />
+    <material name="Power_And_Propulsion_Element" texture="Power_And_Propulsion_Element_BaseColor" specular="0.0" shininess="0.5" />
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512" rgb1=".1 .2 .3" rgb2=".2 .3 .4" />
+    <material name="grid" texture="grid" texrepeat="1 1" texuniform="true" reflectance=".2" />
+  </asset>
+  <worldbody>
+    <geom name="floor" type="plane" pos="0 0 9" size="10 10 0.1" material="grid" condim="1" contype="0" conaffinity="0" />
+  </worldbody>
+</fragment>

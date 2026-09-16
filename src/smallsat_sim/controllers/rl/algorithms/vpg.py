@@ -1,126 +1,61 @@
-import jax
-import jax.numpy as jnp
-from flax import nnx
-import optax
+"""Vanilla policy gradient: exactly one full-rollout actor update."""
+
 from functools import partial
 
-from smallsat_sim.envs.base_env import BaseEnv
-from smallsat_sim.controllers.rl.algorithms.base_agent import BaseAgent
+from flax import nnx
+import jax
+import jax.numpy as jnp
+
+from .base_agent import BaseAgent
+from .optimization import UpdateMetrics, _diag_gaussian_kl, fit_critic
+
+
+def vpg_loss(actor, batch):
+    return -(
+        actor.log_prob(batch.observations, batch.latent_actions) * batch.advantages
+    ).mean()
+
+
+@partial(jax.jit, static_argnames=("graph", "critic_epochs", "num_minibatches"))
+def update_vpg(graph, state, batch, key, *, critic_epochs, num_minibatches):
+    actor, optimizer, critic, critic_optimizer = nnx.merge(graph, state)
+    old_mean, old_log_std = actor.distribution_parameters(batch.observations)
+
+    # One gradient over the entire rollout; there is no actor epoch loop.
+    actor_loss, gradients = nnx.value_and_grad(vpg_loss)(actor, batch)
+    optimizer.update(gradients)
+    state = nnx.state((actor, optimizer, critic, critic_optimizer))
+
+    # The value function can fit the same returns repeatedly.
+    state, critic_loss = fit_critic(
+        graph, state, batch, key, critic_epochs, num_minibatches
+    )
+    actor, _, _, _ = nnx.merge(graph, state)
+    mean, log_std = actor.distribution_parameters(batch.observations)
+    kl = _diag_gaussian_kl(
+        old_mean, jnp.exp(old_log_std), mean, jnp.exp(log_std)
+    ).mean()
+    return state, UpdateMetrics(
+        actor_loss,
+        critic_loss,
+        kl,
+        jnp.array(0.0),
+        jnp.array(1),
+        jnp.array(critic_epochs * num_minibatches),
+    )
 
 
 class VPG(BaseAgent):
-    """
-    Vanilla Policy Gradient (with Generalized Advantage Estimation) agent.
-    """
+    """Use the vanilla policy-gradient objective with separate value fitting."""
 
-    def __init__(
-        self,
-        env,
-        planner,
-        rng_key: jnp.ndarray,
-        activation=nnx.tanh,
-    ) -> None:
-        super().__init__(env, planner, rng_key=rng_key, activation=activation)
+    algorithm = "vpg"
 
-        # Load the hyperparams
-        self._load_vpg_hyperparams()
-
-        # Initialize an ADAM optimizers for the actor and critic networks
-        self.actor_optimizer = nnx.Optimizer(
-            self.actor, optax.adam(learning_rate=self.actor_lr, eps=1e-5)
-        )
-        self.critic_optimizer = nnx.Optimizer(
-            self.critic, optax.adam(learning_rate=self.critic_lr, eps=1e-5)
-        )
-
-        # Jitted loss functions
-        self.jit_actor_loss_and_grad = nnx.jit(
-            nnx.value_and_grad(self.actor_loss_fn),
-            static_argnums=(0,),
-        )
-        self.jit_critic_loss_and_grad = nnx.jit(
-            nnx.value_and_grad(self.critic_loss_fn),
-            static_argnums=(0,),
-        )
-
-    # Define the actor loss
-    def actor_loss_fn(
-        self, actor_model, tdres: jnp.ndarray, obs: jnp.ndarray, actions: jnp.ndarray
-    ):
-        _, logp_a = actor_model.forward(obs, actions)
-        return -jnp.sum(tdres * logp_a)
-
-    # Define the critic loss
-    def critic_loss_fn(self, critic_model, returns: jnp.ndarray, obs: jnp.ndarray):
-        values = critic_model.forward(obs)
-        return jnp.mean((values - returns) ** 2)  # MSE loss
-
-    def update_policy_gradient(
-        self,
-        key,
-        obs_residuals: jnp.ndarray,
-        actions: jnp.ndarray,
-        tdres: jnp.ndarray,
-        logp: jnp.ndarray,
-        minibatch: bool = True,
-    ) -> jnp.ndarray:
-        """
-        Update the policy gradient.
-        """
-        actor_loss = jnp.array(0.0, dtype=tdres.dtype)
-        for _ in range(self.actor_training_epochs):
-            # Compute the actor loss
-            actor_loss, grads = self.jit_actor_loss_and_grad(self.actor, tdres)
-            print(f"{actor_loss = }")
-
-            # Update the gradients
-            self.actor_optimizer.update(grads)
-
-        return actor_loss
-
-    def update_value_function(
-        self,
-        key,
-        obs_residuals: jnp.ndarray,
-        returns: jnp.ndarray,
-        minibatch: bool = True,
-    ) -> jnp.ndarray:
-        """
-        Update the value function.
-        """
-        critic_loss = jnp.array(0.0, dtype=returns.dtype)
-        for _ in range(self.critic_training_epochs):
-            # Compute the critic loss
-            critic_loss, grads = self.jit_critic_loss_and_grad(self.critic, returns)
-            print(f"{critic_loss = }")
-
-            # Update the gradients
-            self.critic_optimizer.update(grads)
-
-        return critic_loss
-
-    def _load_vpg_hyperparams(self) -> None:
-        """
-        Load VPG-specific hyperparams.
-        """
-        self.steps_per_epoch = self.env.env_cfg.control.RL.VPG.steps_per_epoch
-        self.epochs = self.env.env_cfg.control.RL.VPG.epochs
-        self.max_ep_len = self.env.env_cfg.control.RL.VPG.max_ep_len
-        self.gamma = self.env.env_cfg.control.RL.VPG.gamma
-        self.lam = self.env.env_cfg.control.RL.VPG.lam
-        self.actor_lr = self.env.env_cfg.control.RL.VPG.actor_lr
-        self.critic_lr = self.env.env_cfg.control.RL.VPG.critic_lr
-        self.actor_training_epochs = int(
-            self.env.env_cfg.control.RL.VPG.actor_training_epochs
-        )
-        self.critic_training_epochs = int(
-            self.env.env_cfg.control.RL.VPG.critic_training_epochs
-        )
-
-    def _log(self, run_id: int, timestamp: float, env: BaseEnv) -> None:
-        """
-        Logs desired quantities if flag is enabled
-        """
-        raise NotImplementedError(
-            f"The _log method is not implemented for the class {self.__class__.__name__}"
+    def update_parameters(self, graph, state, batch, key):
+        return update_vpg(
+            graph,
+            state,
+            batch,
+            key,
+            critic_epochs=self.critic_training_epochs,
+            num_minibatches=self.num_minibatches,
         )

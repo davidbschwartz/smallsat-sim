@@ -1,0 +1,96 @@
+# Simulation and controller settings. Matrices use !array.
+model: cubesat
+compiler:
+  convexhull: 'true'
+visual:
+  headlight:
+    ambient: 0.5 0.5 0.5
+    specular: 0.5 0.5 0.5
+    diffuse: 0.5 0.5 0.5
+gateway:
+  dock_sites:
+  - name: dock_orion_port_a
+    pos: [-13.8, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [-1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [1.0, 0.2, 0.2, 0.8]
+  - name: dock_orion_interface_a
+    pos: [-5.95, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [-1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.2, 1.0, 0.35, 0.85]
+  - name: dock_halo_ihab_interface_a
+    pos: [0.89, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [1.0, 0.75, 0.2, 0.85]
+  - name: dock_halo_ppe_interface_a
+    pos: [7.34, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.95, 0.55, 0.15, 0.85]
+  - name: dock_crew_airlock_a
+    pos: [-3.11, -6.97, -0.02]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [0.0, -1.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.4, 0.9, 1.0, 0.85]
+  - name: dock_hls_side_a
+    pos: [3.62, 7.82, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [0.0, 1.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.65, 1.0, 0.65, 0.85]
+  - name: dock_logistics_side_a
+    pos: [3.69, -10.03, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [0.0, -1.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.75, 0.85, 1.0, 0.85]
+  - name: dock_ppe_port_a
+    pos: [13.2, 0.0, 0.0]
+    quat: [1.0, 0.0, 0.0, 0.0]
+    approach_axis: [1.0, 0.0, 0.0]
+    approach_offset: 2.0
+    size: [0.2]
+    rgba: [0.2, 0.7, 1.0, 0.8]
+Bodies:
+  num_bodies: 1
+  bodies_list:
+  - name: body0
+    pos: [0, 0, 10]
+    euler: [0, 0, 0]
+control:
+  PD:
+    control_decimation: 10
+    gains:
+      Kp_x: 0.36749999999999994
+      Kd_x: 2.0999999999999996
+      Kp_q: 0.03200000000000001
+      Kd_q: 0.04000000000000001
+  LQR:
+    control_decimation: 25
+    cost:
+      Q: !diag [1.0, 1.0, 1.0, 4.0, 4.0, 4.0, 4.0, 10.0, 10.0, 10.0, 1.0, 1.0, 1.0]
+      R: !diag [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+      Q_e: !diag [1.0, 1.0, 1.0]
+  NominalMPC:
+    control_decimation: 25
+    Ts: 0.25
+    N: 80
+    cost:
+      Q: !diag [1.0, 1.0, 1.0, 4.0, 4.0, 4.0, 4.0, 10.0, 10.0, 10.0, 1.0, 1.0, 1.0]
+      R: !diag [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+      T: !diag [1.5, 1.5, 1.5, 6.0, 6.0, 6.0, 6.0, 15.0, 15.0, 15.0, 1.5, 1.5, 1.5]
+      Q_e: !diag [1.0, 1.0, 1.0]

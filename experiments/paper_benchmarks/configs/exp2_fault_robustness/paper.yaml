@@ -1,0 +1,13 @@
+experiment: exp2_fault_robustness
+controllers:
+- mpc
+conditions:
+- nominal
+- stuck_off
+- stuck_on
+- saturated_thrust
+- thrust_instability
+- faulty_valve
+- disturbance
+trials: 100
+spacecraft: astrobee

@@ -1,4 +1,5 @@
-from typing import TypeVar
+"""Base controller interface shared by classical and learned controllers."""
+
 from abc import abstractmethod, ABC
 import numpy as np
 import jax.numpy as jnp
@@ -7,7 +8,7 @@ from smallsat_sim.envs.base_env import BaseEnv
 from smallsat_sim.planners.base_planner import BasePlanner
 
 
-T = TypeVar("T", np.ndarray, jnp.ndarray)
+ControlInput = np.ndarray | jnp.ndarray
 
 
 class BaseController(ABC):
@@ -27,7 +28,7 @@ class BaseController(ABC):
             self.has_logger = True
 
     @abstractmethod
-    def get_control_input(self, env: BaseEnv) -> T:
+    def get_control_input(self, env: BaseEnv) -> ControlInput:
         """
         Returns the control input
         """
