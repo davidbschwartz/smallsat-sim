@@ -1,9 +1,20 @@
-# Demonstration use cases
+# Paper benchmarks
 
 Run experiments for parallel simulation throughput, classical fault robustness,
 reinforcement-learning robustness, Gateway contact, and spacecraft portability.
 The suite records reproducible run configurations and generates figures and tables
 from retained raw data. Experiment settings and run matrices are in `configs/`.
+
+Paper-specific plotting, rendering, and audit tools live in
+[`publication/`](publication/README.md). Their source is version-controlled;
+generated publication outputs remain under the ignored `paper/` directory.
+
+This package was renamed from `experiments.demonstration_use_cases`.
+The old module path remains a compatibility alias for archived configurations
+and commands. Existing `results/demonstration_use_cases` and
+`artifacts/demonstration_use_cases` defaults, serialized effect references, and
+success-definition IDs are retained to preserve saved-run identity. New commands
+should use `experiments.paper_benchmarks`; output roots can be set explicitly.
 
 `--paper` selects the checked-in evaluation protocol; it does not certify that
 a campaign has completed. Docking measures a local approach and compliant contact;
@@ -21,17 +32,17 @@ Matplotlib is required for artifact generation and is included in the `paper`
 extra. Rendering and W&B are disabled by default.
 
 ```bash
-python -m experiments.demonstration_use_cases.exp1_scaling --paper
-python -m experiments.demonstration_use_cases.exp2_fault_robustness --paper
-python -m experiments.demonstration_use_cases.exp3_rl_robustness --paper
-python -m experiments.demonstration_use_cases.exp4_docking --paper
-python -m experiments.demonstration_use_cases.spacecraft_portability --paper
+python -m experiments.paper_benchmarks.exp1_scaling --paper
+python -m experiments.paper_benchmarks.exp2_fault_robustness --paper
+python -m experiments.paper_benchmarks.exp3_rl_robustness --paper
+python -m experiments.paper_benchmarks.exp4_docking --paper
+python -m experiments.paper_benchmarks.spacecraft_portability --paper
 
 # Does not run simulation or training:
-python -m experiments.demonstration_use_cases.aggregate
+python -m experiments.paper_benchmarks.aggregate
 
 # Sequential full campaign, followed by strict artifact generation:
-python -m experiments.demonstration_use_cases.reproduce_all --paper
+python -m experiments.paper_benchmarks.reproduce_all --paper
 ```
 
 Use `--plan` to inspect all jobs without allocating environments. Use `--smoke`
@@ -40,10 +51,10 @@ requires acados for MPC; it never substitutes another controller. CPU-only users
 are installed. GPU scaling requires a GPU; CPU smoke throughput does not validate it.
 
 ```bash
-python -m experiments.demonstration_use_cases.spacecraft_portability --smoke
-python -m experiments.demonstration_use_cases.exp1_scaling --smoke
-python -m experiments.demonstration_use_cases.exp3_rl_robustness --smoke
-python -m experiments.demonstration_use_cases.aggregate --mode smoke --allow-partial \
+python -m experiments.paper_benchmarks.spacecraft_portability --smoke
+python -m experiments.paper_benchmarks.exp1_scaling --smoke
+python -m experiments.paper_benchmarks.exp3_rl_robustness --smoke
+python -m experiments.paper_benchmarks.aggregate --mode smoke --allow-partial \
   --output artifacts/demonstration_use_cases_smoke
 ```
 
@@ -96,14 +107,14 @@ python -c "import jax; print(jax.devices()); assert jax.default_backend() == 'gp
 python -m pytest src/tests/test_rl_scenario_evaluation.py -q
 
 # Small end-to-end runs for both algorithms, including real checkpoint writes.
-python -m experiments.demonstration_use_cases.exp3_rl_robustness --smoke \
+python -m experiments.paper_benchmarks.exp3_rl_robustness --smoke \
   --output results/demonstration_mjx_v2_smoke \
   --job-id controller-ppo_regime-nominal_seed-0_spacecraft-astrobee \
   --job-id controller-sac_regime-nominal_seed-0_spacecraft-astrobee
 
 # Inspect the 20 policy jobs + two classical baselines, then launch.
-python -m experiments.demonstration_use_cases.exp3_rl_robustness --paper --plan
-python -m experiments.demonstration_use_cases.exp3_rl_robustness --paper \
+python -m experiments.paper_benchmarks.exp3_rl_robustness --paper --plan
+python -m experiments.paper_benchmarks.exp3_rl_robustness --paper \
   --output results/demonstration_mjx_v2 --resume
 ```
 
@@ -117,7 +128,7 @@ above; `--job-id` can select just the learned policies.
 ### Re-evaluate a saved policy without training
 
 ```bash
-python -m experiments.demonstration_use_cases.exp3_rl_robustness \
+python -m experiments.paper_benchmarks.exp3_rl_robustness \
   --evaluate-run PATH_TO_SAVED_RUN \
   --output results/demonstration_reevaluation
 ```
@@ -230,7 +241,7 @@ For custom development runs, export a complete config and edit it:
 ```python
 from pathlib import Path
 import yaml
-from experiments.demonstration_use_cases.common import load_config
+from experiments.paper_benchmarks.common import load_config
 
 cfg = load_config("exp2_fault_robustness", mode="smoke")
 cfg["protocol"]["controllers"] = ["pd"]  # explicit development comparison
@@ -238,7 +249,7 @@ Path("/tmp/experiment.yaml").write_text(yaml.safe_dump(cfg))
 ```
 
 ```bash
-python -m experiments.demonstration_use_cases.exp2_fault_robustness \
+python -m experiments.paper_benchmarks.exp2_fault_robustness \
   --config /tmp/experiment.yaml --output results/my_pilot
 ```
 
@@ -266,7 +277,7 @@ New evaluation runs for experiments 2–4 save compressed pose recordings under
 episodes for learned policies and baselines. Rendering runs separately:
 
 ```bash
-python -m experiments.demonstration_use_cases.replay \
+python -m experiments.paper_benchmarks.replay \
   results/demonstration_use_cases/paper/<experiment>/<run>/recordings/<condition>/0000.npz \
   --output artifacts/episode --width 1920 --height 1080
 ```

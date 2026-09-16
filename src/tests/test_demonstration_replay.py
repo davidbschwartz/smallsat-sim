@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from experiments.demonstration_use_cases.replay import EpisodeRecording, frame_indices
+from experiments.paper_benchmarks.replay import EpisodeRecording, frame_indices
 
 
 def test_recording_copies_initial_and_final_poses(tmp_path):

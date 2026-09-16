@@ -30,7 +30,7 @@ and evaluating spacecraft controllers. It includes:
 [Define an experiment](#define-your-own-experiment) ·
 [Extend the API](#extend-the-api) ·
 [Train and evaluate](#training-and-evaluation) · [View and record](#viewers-and-video) ·
-[Demonstration use cases](#demonstration-use-cases) · [Development](#development)
+[Paper benchmarks](#paper-benchmarks) · [Development](#development)
 
 ## Installation
 
@@ -90,12 +90,15 @@ See [.setup/native/install_mpc.sh](.setup/native/install_mpc.sh) for build detai
 
 </details>
 
-## Demonstration use cases
+## Paper benchmarks
 
 **Learn SmallSatSim** with the quick start and editable [examples](examples).
-**Run reproducible experiments** with the [demonstration use case package](experiments/demonstration_use_cases/README.md).
+**Run reproducible experiments** with the [paper benchmark package](experiments/paper_benchmarks/README.md).
+
+The [publication tools](experiments/paper_benchmarks/publication/README.md) reproduce
+paper figures from retained data; generated files remain in the ignored `paper/` directory.
 The package includes Astrobee (`astrobee`), CubeSat (`cubesat`), and Sprint (`sprint`)
-portability checks. Full demonstration results have not yet been generated.
+portability checks. Campaign manifests record completion and missing runs.
 The experiment README documents execution, outputs, and validation limits.
 
 Use the Linux/NVIDIA installation with native MPC for the full suite. Retain your
@@ -103,16 +106,16 @@ installed extras when adding the plotting dependency:
 
 ```bash
 uv sync --locked --extra cuda12 --extra warp --extra mpc --extra paper
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.exp1_scaling --paper
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.exp2_fault_robustness --paper
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.exp3_rl_robustness --paper
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.exp4_docking --paper
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.spacecraft_portability --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp1_scaling --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp2_fault_robustness --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp3_rl_robustness --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp4_docking --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.spacecraft_portability --paper
 
 # Regenerate figures/tables from raw data, without retraining:
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.aggregate
+bash .setup/smallsat run python -m experiments.paper_benchmarks.aggregate
 # Or run the full campaign and generate its artifacts:
-bash .setup/smallsat run python -m experiments.demonstration_use_cases.reproduce_all --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.reproduce_all --paper
 ```
 
 Raw runs are retained under `results/demonstration_use_cases/paper`, identified by configuration,
@@ -803,7 +806,7 @@ also inspect a live run or short recording on the target platform.
 
 For training or performance changes, use the focused
 [SAC regression tests](src/tests/test_sac.py),
-[spacecraft portability experiments](experiments/demonstration_use_cases/README.md), or
+[spacecraft portability experiments](experiments/paper_benchmarks/README.md), or
 [throughput profiler](experiments/rl_benchmarking/measure_performance.py).
 Their short runs do not establish spacecraft convergence or algorithm superiority.
 

@@ -6,8 +6,8 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
-from experiments.demonstration_use_cases.common import evaluation_trial_count
-from experiments.demonstration_use_cases.common import (
+from experiments.paper_benchmarks.common import evaluation_trial_count
+from experiments.paper_benchmarks.common import (
     EXPERIMENTS,
     load_config,
     Run,
@@ -16,15 +16,30 @@ from experiments.demonstration_use_cases.common import (
     digest,
     write_json,
 )
-from experiments.demonstration_use_cases.task import sample_trial, PoseMetrics
-from experiments.demonstration_use_cases.aggregate import (
+from experiments.paper_benchmarks.task import sample_trial, PoseMetrics
+from experiments.paper_benchmarks.aggregate import (
     wilson,
     validate_rows,
     summarize,
     discover,
     learning_curves,
 )
-from experiments.demonstration_use_cases.make_tables import tabular, escape
+from experiments.paper_benchmarks.make_tables import tabular, escape
+
+
+def test_legacy_package_preserves_saved_config_and_effect_references():
+    from importlib import import_module
+    from experiments.demonstration_use_cases.common import load_config as legacy_load
+    from experiments.paper_benchmarks.effects import training_effects
+
+    config = load_config("exp3_rl_robustness", mode="paper")
+    assert legacy_load("exp3_rl_robustness", mode="paper") == config
+    faults, wrenches = training_effects(config["common"]["train_distribution"])
+    for effect in faults + wrenches:
+        for key in ["sample", "apply"]:
+            module, name = effect[key].split(":")
+            assert module == "experiments.demonstration_use_cases.effects"
+            assert callable(getattr(import_module(module), name))
 
 
 @pytest.mark.parametrize("experiment", EXPERIMENTS)
@@ -135,7 +150,7 @@ def test_latex_structure_and_escaping():
 
 @pytest.mark.parametrize("name", ["astrobee", "cubesat", "sprint"])
 def test_native_vehicle_portability(tmp_path, name):
-    from experiments.demonstration_use_cases.runtime import NativeEnvironment, SetpointPlanner, controller
+    from experiments.paper_benchmarks.runtime import NativeEnvironment, SetpointPlanner, controller
 
     c = load_config("spacecraft_portability", mode="smoke")
     env = NativeEnvironment(c, name, SimpleNamespace(path=tmp_path))
@@ -158,7 +173,7 @@ def test_native_vehicle_portability(tmp_path, name):
     ],
 )
 def test_fault_conditions(tmp_path, condition):
-    from experiments.demonstration_use_cases.runtime import vehicle, fault_mapping
+    from experiments.paper_benchmarks.runtime import vehicle, fault_mapping
 
     c = load_config("exp2_fault_robustness")
     v = vehicle(c, "astrobee", tmp_path)
@@ -178,7 +193,7 @@ def test_fault_conditions(tmp_path, condition):
 
 
 def test_contact_accumulator():
-    from experiments.demonstration_use_cases.exp4_docking import ContactMetrics
+    from experiments.paper_benchmarks.exp4_docking import ContactMetrics
 
     m = ContactMetrics(0.01)
     for time, active, force in [
@@ -201,7 +216,7 @@ def test_contact_accumulator():
 
 
 def test_docking_short_execution(tmp_path):
-    from experiments.demonstration_use_cases.exp4_docking import docking
+    from experiments.paper_benchmarks.exp4_docking import docking
 
     c = load_config("exp4_docking", mode="smoke")
     c["protocol"]["controller"] = "pd"
@@ -226,8 +241,8 @@ def test_docking_short_execution(tmp_path):
 
 
 def test_publication_files_deterministic(tmp_path):
-    from experiments.demonstration_use_cases.make_figures import make_figures
-    from experiments.demonstration_use_cases.make_tables import make_tables
+    from experiments.paper_benchmarks.make_figures import make_figures
+    from experiments.paper_benchmarks.make_tables import make_tables
 
     data = tmp_path / "data"
     data.mkdir()
@@ -251,7 +266,7 @@ def test_publication_files_deterministic(tmp_path):
 
 def test_complete_synthetic_campaign_and_missing_run(tmp_path):
     """Coverage checks, aggregation and publications share one fixed mock campaign."""
-    from experiments.demonstration_use_cases.aggregate import aggregate
+    from experiments.paper_benchmarks.aggregate import aggregate
 
     root = tmp_path / "raw"
     for experiment in EXPERIMENTS:
@@ -348,7 +363,7 @@ def test_complete_synthetic_campaign_and_missing_run(tmp_path):
 
 def test_actual_contact_force_is_filtered_and_integrated():
     import mujoco
-    from experiments.demonstration_use_cases.exp4_docking import contact_force, ContactMetrics
+    from experiments.paper_benchmarks.exp4_docking import contact_force, ContactMetrics
 
     model = mujoco.MjModel.from_xml_string("""<mujoco>
       <option timestep="0.002" gravity="0 0 0"/>
@@ -401,8 +416,8 @@ def test_rate_limited_docking_reference_uses_simulation_time():
 
 def test_initial_docking_penetration_is_retained_without_control(tmp_path):
     from unittest.mock import Mock
-    from experiments.demonstration_use_cases.exp4_docking import run_trial
-    from experiments.demonstration_use_cases.runtime import NativeEnvironment
+    from experiments.paper_benchmarks.exp4_docking import run_trial
+    from experiments.paper_benchmarks.runtime import NativeEnvironment
     from smallsat_sim.planners.mission.docking import DockingPlanner
 
     c = load_config("exp4_docking")
@@ -449,7 +464,7 @@ def test_rl_demonstration_training_matrix():
 
 
 def test_experiment_overrides_are_explicit_and_reject_typos():
-    from experiments.demonstration_use_cases.common import _apply_overrides
+    from experiments.paper_benchmarks.common import _apply_overrides
     base = {'training': {'PPO': {'epochs': 80}}, 'episode_steps': 512}
     _apply_overrides(base, {'training': {'PPO': {'epochs': 320}}})
     assert base == {'training': {'PPO': {'epochs': 320}}, 'episode_steps': 512}
@@ -458,7 +473,7 @@ def test_experiment_overrides_are_explicit_and_reject_typos():
 
 
 def test_resume_validates_complete_jobs_and_rejects_duplicates(tmp_path):
-    from experiments.demonstration_use_cases.common import completed_job
+    from experiments.paper_benchmarks.common import completed_job
     from copy import deepcopy
     config = load_config('spacecraft_portability', mode='smoke')
     job = jobs(config)[0]
@@ -481,7 +496,7 @@ def test_resume_validates_complete_jobs_and_rejects_duplicates(tmp_path):
 
 
 def test_resume_rejects_active_job_and_smoke_limits_algorithm_batches(tmp_path):
-    from experiments.demonstration_use_cases.common import completed_job
+    from experiments.paper_benchmarks.common import completed_job
     config = load_config('exp3_rl_robustness', mode='smoke')
     assert config['protocol']['training_num_envs']['sac'] == 2
     job = jobs(config)[0]
@@ -491,7 +506,7 @@ def test_resume_rejects_active_job_and_smoke_limits_algorithm_batches(tmp_path):
 
 
 def test_isolated_rl_worker_metadata_survives_parent_commit(tmp_path, monkeypatch):
-    from experiments.demonstration_use_cases import exp3_rl_robustness as experiment
+    from experiments.paper_benchmarks import exp3_rl_robustness as experiment
     config = load_config('exp3_rl_robustness', mode='smoke')
     job = jobs(config)[0]
     def worker(command, **kwargs):
@@ -512,7 +527,7 @@ def test_isolated_rl_worker_metadata_survives_parent_commit(tmp_path, monkeypatc
 
 
 def test_training_health_distinguishes_numerics_from_performance():
-    from experiments.demonstration_use_cases.aggregate import training_health
+    from experiments.paper_benchmarks.aggregate import training_health
     base = dict(run_id='run', controller='sac', regime='nominal', training_seed=0,
                 completed_episode_count=0, success_termination_step_count=0,
                 mean_lateral_error=2., mean_angle_error=100., mean_episodic_returns=-1.)
@@ -530,7 +545,7 @@ def test_training_health_distinguishes_numerics_from_performance():
 @pytest.mark.parametrize("algorithm", ["ppo", "sac"])
 @pytest.mark.parametrize("defect", [None, "checkpoint", "budget", "axis", "training"])
 def test_resume_and_aggregation_share_training_validation(tmp_path, algorithm, defect):
-    from experiments.demonstration_use_cases.common import completed_job
+    from experiments.paper_benchmarks.common import completed_job
 
     config = load_config("exp3_rl_robustness", mode="smoke")
     job = next(job for job in jobs(config)
@@ -565,7 +580,7 @@ def test_resume_and_aggregation_share_training_validation(tmp_path, algorithm, d
 
 
 def test_removed_curriculum_is_rejected_including_smoke():
-    from experiments.demonstration_use_cases.common import validate_config, _configure_smoke
+    from experiments.paper_benchmarks.common import validate_config, _configure_smoke
 
     config = load_config("exp3_rl_robustness", mode="development")
     config["protocol"]["sac_curriculum"] = [{"from_transition": 0, "scale": 1.0}]
@@ -579,7 +594,7 @@ def test_removed_curriculum_is_rejected_including_smoke():
 @pytest.mark.parametrize("key", ["checkpoint_intervals", "training_num_envs", "trials"])
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5])
 def test_protocol_integer_settings_reject_invalid_values(key, value):
-    from experiments.demonstration_use_cases.common import validate_config
+    from experiments.paper_benchmarks.common import validate_config
 
     config = load_config("exp3_rl_robustness", mode="development")
     config["protocol"][key] = value if key == "trials" else {"sac": value}
@@ -588,7 +603,7 @@ def test_protocol_integer_settings_reject_invalid_values(key, value):
 
 
 def test_removed_training_evaluation_is_rejected():
-    from experiments.demonstration_use_cases.common import validate_config
+    from experiments.paper_benchmarks.common import validate_config
 
     config = load_config("exp3_rl_robustness", mode="development")
     config["protocol"]["sac_training_evaluation"] = dict(
@@ -618,7 +633,7 @@ def test_rl_suite_distinctness_pairing_and_single_fixed_probe():
 
 @pytest.mark.parametrize('overrides', [{'nominal':0}, {'missing':1}, {'nominal':True}, []])
 def test_invalid_condition_counts_rejected(overrides):
-    from experiments.demonstration_use_cases.common import validate_config
+    from experiments.paper_benchmarks.common import validate_config
     config = load_config('exp3_rl_robustness', mode='smoke')
     config['protocol']['evaluation_trials']=overrides
     with pytest.raises(ValueError,match='evaluation_trials'):

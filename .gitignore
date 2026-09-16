@@ -73,8 +73,8 @@ results/controller_pilots/
 .ruff_cache/
 
 # Published pilot evidence belongs with its configurations.
-!experiments/demonstration_use_cases/pilots/**/trials.csv
-!experiments/demonstration_use_cases/pilots/**/summary.csv
+!experiments/paper_benchmarks/pilots/**/trials.csv
+!experiments/paper_benchmarks/pilots/**/summary.csv
 
 # Local publication workspace, source archives, and unpublished planning notes.
 /paper/

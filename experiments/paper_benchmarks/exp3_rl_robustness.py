@@ -68,7 +68,7 @@ def isolated_training(config, job, run):
     write_json(run.path / "job.json", job)
     with (run.path / "worker.log").open("w") as log:
         result = subprocess.run(
-            [sys.executable, "-u", "-m", "experiments.demonstration_use_cases.exp3_rl_robustness",
+            [sys.executable, "-u", "-m", "experiments.paper_benchmarks.exp3_rl_robustness",
              "--worker", str(run.path.resolve())], stdout=log, stderr=subprocess.STDOUT,
         )
     # The worker records checkpoint/timing fields; retain them when the parent

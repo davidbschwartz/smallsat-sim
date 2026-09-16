@@ -28,6 +28,7 @@ def apply_wrench(data, values, time, dt):
 
 
 def training_effects(distribution):
+    # Keep archived configuration fingerprints stable; the legacy package forwards here.
     prefix = "experiments.demonstration_use_cases.effects:"
     fault = {
         "sample": prefix + "sample_thrust",

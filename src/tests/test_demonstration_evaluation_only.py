@@ -5,9 +5,9 @@ import json
 import pytest
 import yaml
 
-from experiments.demonstration_use_cases.common import load_config, run_directory, write_json
-from experiments.demonstration_use_cases.exp3_rl_robustness import main, train_evaluate
-from experiments.demonstration_use_cases.aggregate import records, validate_run_records
+from experiments.paper_benchmarks.common import load_config, run_directory, write_json
+from experiments.paper_benchmarks.exp3_rl_robustness import main, train_evaluate
+from experiments.paper_benchmarks.aggregate import records, validate_run_records
 from smallsat_sim.controllers.rl.runners.on_policy_runner import OnPolicyRunner
 from smallsat_sim.controllers.rl.runners.off_policy_runner import OffPolicyRunner
 

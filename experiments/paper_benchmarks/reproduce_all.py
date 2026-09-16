@@ -19,7 +19,7 @@ def main(argv=None):
         cmd = [
             sys.executable,
             "-m",
-            "experiments.demonstration_use_cases." + experiment,
+            "experiments.paper_benchmarks." + experiment,
             "--output",
             str(args.output),
         ]

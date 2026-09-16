@@ -71,7 +71,7 @@ def isolated(config, job, run):
             [
                 sys.executable,
                 "-m",
-                "experiments.demonstration_use_cases.exp1_scaling",
+                "experiments.paper_benchmarks.exp1_scaling",
                 "--worker",
                 str(run.path.resolve()),
             ],
