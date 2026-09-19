@@ -166,6 +166,6 @@ def test_visualized_rollout_preserves_results_and_captures_before_reset(monkeypa
 
     monkeypatch.setattr(fixtures.ru, "run_functional_rollout", instrumented)
     # Reuse the numerical assertions on returns, resets and final state.
-    fixtures.test_run_functional_rollout_resets_and_reports_returns()
+    fixtures.test_run_functional_rollout_resets_and_reports_returns(single_episode=False)
     jax.effects_barrier()
     assert received == [1, 0, 1]

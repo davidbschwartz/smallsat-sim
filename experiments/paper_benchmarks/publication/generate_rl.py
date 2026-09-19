@@ -1,6 +1,7 @@
 """Regenerate the paper RL figure from an exported experiment 3 CSV bundle."""
 
 import argparse
+import copy
 from collections import defaultdict
 import hashlib
 import json
@@ -69,6 +70,28 @@ class RLBuild(Build):
                 "offsets do not alter success values."
             )
             counts = self.count_description
+            for index, stem, purpose in [
+                (0, "training", "Training episode returns"),
+                (1, "evaluation", "Evaluation success under distribution shift"),
+            ]:
+                # Copy the plotted artists so both exports retain identical data.
+                standalone = copy.deepcopy(fig)
+                axis = standalone.axes[index]
+                for other in list(standalone.axes):
+                    if other is not axis:
+                        standalone.delaxes(other)
+                axis.set_subplotspec(standalone.add_gridspec(1, 1)[0])
+                standalone.set_size_inches(5.2, 3.8)
+                standalone.legends.clear()
+                panel_handles, panel_labels = axis.get_legend_handles_labels()
+                standalone.legend(
+                    panel_handles, panel_labels, loc="upper center", ncol=2,
+                    frameon=False, fontsize=10, bbox_to_anchor=(0.5, 1.0),
+                )
+                super().figure(
+                    standalone, f"figures/rl/{stem}", exp, purpose,
+                    counts, convention, extra,
+                )
         elif name == "diagnostics/rl/evaluation_seeds":
             counts = self.count_description
             convention = "Each curve is one training seed; no smoothing or omitted seeds."
@@ -95,6 +118,8 @@ def main():
     }
     (args.output / 'rl_v3_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(args.output / 'figures/rl/learning_and_shift.pdf')
+    print(args.output / 'figures/rl/training.pdf')
+    print(args.output / 'figures/rl/evaluation.pdf')
     print(build.count_description)
 
 

@@ -141,8 +141,8 @@ class Build:
         frame.to_csv(path, index=False, float_format="%.17g")
         self.register(path, exp, purpose, f"{len(frame)} rows", convention)
 
-    def figure(self, fig, name, exp, purpose, counts="", convention="", extra=()):
-        fig.tight_layout(pad=0.6, rect=(0, 0, 1, 0.90) if fig.legends else (0, 0, 1, 1))
+    def figure(self, fig, name, exp, purpose, counts="", convention="", extra=(), *, layout_pad=0.6):
+        fig.tight_layout(pad=layout_pad, rect=(0, 0, 1, 0.90) if fig.legends else (0, 0, 1, 1))
         for suffix in ["pdf", "png"]:
             path = self.output / (name + "." + suffix)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,16 +266,19 @@ class Build:
             "All run completion states and failed trial counts",
         )
 
-    def distributions(self, frame, order, metrics, name, exp):
+    def distributions(self, frame, order, metrics, name, exp, *, vertical=False):
         # Share readable condition labels instead of repeating tiny rotated text.
         fig, axes = plt.subplots(
-            1, len(metrics), figsize=(7.1, 3.4), squeeze=False, sharey=True
+            len(metrics) if vertical else 1,
+            1 if vertical else len(metrics),
+            figsize=(7.1, 7.5) if vertical else (7.1, 3.4),
+            squeeze=False, sharex=vertical, sharey=not vertical,
         )
-        for ax, metric in zip(axes[0], metrics):
+        for ax, metric in zip(axes.flat, metrics):
             samples = [frame.loc[frame.condition == c, metric].dropna().to_numpy() for c in order]
             ax.boxplot(
                 samples,
-                orientation="horizontal",
+                orientation="vertical" if vertical else "horizontal",
                 tick_labels=[c.replace("_", " ").capitalize() for c in order],
                 widths=0.55,
                 showfliers=False,
@@ -285,14 +288,29 @@ class Build:
             for i, values in enumerate(samples):
                 # Deterministic jitter; every observed value shown, including failures.
                 jitter = np.random.default_rng(0).uniform(-0.17, 0.17, len(values))
-                ax.scatter(values, i + 1 + jitter, s=3, alpha=0.35, color="#0072B2", linewidths=0)
+                x, y = (i + 1 + jitter, values) if vertical else (values, i + 1 + jitter)
+                ax.scatter(x, y, s=3, alpha=0.35, color="#0072B2", linewidths=0)
             label = METRICS[metric].replace(" error [", " error\n[").replace(" impulse [", " impulse\n[")
+            if vertical:
+                ax.set_ylabel(label, fontsize=13)
+                ax.tick_params(axis="y", labelsize=12)
+                ax.tick_params(axis="x", labelsize=11, length=0)
+                ax.spines["bottom"].set_visible(False)
+                ax.grid(axis="y", alpha=0.15)
+                continue
             ax.set_xlabel(label, fontsize=10)
             ax.tick_params(axis="x", labelsize=9)
             ax.tick_params(axis="y", labelsize=10, length=0)
             ax.spines["left"].set_visible(False)
             ax.grid(axis="x", alpha=0.15)
-        axes[0, 0].invert_yaxis()
+        if vertical:
+            fig.align_ylabels(axes[:, 0])
+            axes[-1, 0].set_xticks(
+                range(1, len(order) + 1),
+                [c.replace("_", "\n").capitalize() for c in order],
+            )
+        else:
+            axes[0, 0].invert_yaxis()
         self.figure(
             fig,
             name,
@@ -300,6 +318,7 @@ class Build:
             "Monte Carlo distributions",
             f"{len(frame)} trials",
             "All trials; boxes Q1/median/Q3, whiskers 1.5 IQR; every finite sample plotted; unavailable counts in tables.",
+            layout_pad=1.8 if vertical else 0.6,
         )
 
     def quantitative(self):
@@ -345,7 +364,7 @@ class Build:
             "Scaling table",
             "Arithmetic mean over repeats; sample SD (ddof=1); speedup vs N=1 same backend.",
         )
-        fig, ax = plt.subplots(figsize=(3.5, 2.5))
+        fig, ax = plt.subplots(figsize=(3.5, 2.1))
         ax.errorbar(
             stats.num_envs,
             stats.aggregate_env_steps_per_s,
@@ -358,7 +377,7 @@ class Build:
             xscale="log",
             yscale="log",
             xlabel="Parallel environments",
-            ylabel="Aggregate environment steps / s",
+            ylabel="Aggregate environment\nsteps / s",
         )
         ax.set_xticks(stats.num_envs, stats.num_envs.astype(str), rotation=45)
         self.figure(
@@ -423,6 +442,14 @@ class Build:
             list(METRICS)[:3],
             "figures/model_based_robustness/distributions",
             exp,
+        )
+        self.distributions(
+            self.frames[exp],
+            self.configs[exp]["protocol"]["conditions"],
+            list(METRICS)[:3],
+            "figures/model_based_robustness/distributions_vertical",
+            exp,
+            vertical=True,
         )
         self.rl()
         self.docking()
@@ -641,11 +668,11 @@ class Build:
             exp,
             "Deterministic representative used for both plot and renders",
         )
-        fig, axes = plt.subplots(3, 1, figsize=(3.5, 4), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(3.5, 3.3), sharex=True)
         for ax, key, label in zip(
             axes,
             ["position_error", "attitude_error", "contact_force"],
-            ["Position error [m]", "Attitude error [rad]", "Contact force [N]"],
+            ["Position error\n[m]", "Attitude error\n[rad]", "Contact force\n[N]"],
         ):
             ax.plot(trace.time, trace[key], "k-", linewidth=0.8)
             if pd.notna(chosen.first_contact_time):
