@@ -6,9 +6,6 @@
 /____/_/ /_/ /_/\__,_/_/_//____/\__,_/\__//____/_/_/ /_/ /_/
 ```
 
-
-SmallSatSim emerged from the SmallSat Steward project, a collaboration between researchers at Caltech's Jet Propulsion Laboratory (now University of Southern California) and the University of Michigan's Space Systems Laboratory. This project is open-sourced under an [Apache 2.0 license](LICENSE).
-
 **SmallSatSim: A GPU-Accelerated Microgravity Robotics Toolkit for Planning, Control, and Policy Learning**
 
 [**Project page**](https://smallsatsim.github.io)
@@ -18,19 +15,25 @@ and evaluating spacecraft controllers. It includes:
 
 - **Spacecraft and tasks:** Astrobee, CubeSat, and nominal AERCam Sprint assets, setpoint control, path
   tracking, and mission planning.
-- **Classical and learned control:** PD, LQR, MPC, MPCC, GP-MPC, and PPO
-  training by default, with optional CNN or transformer adaptation. VPG and SAC
-  are also available.
+- **Classical and learned control:** PD, LQR, MPC, MPCC, GP-MPC, and policy
+  learning with PPO (the default), VPG, or SAC; optional CNN or transformer
+  adaptation for PPO.
 - **Robustness experiments:** actuator faults, external disturbances, custom
   rewards and termination conditions, and seeded evaluation scenarios.
 - **Visualization and results:** native and browser viewers, MP4 recording,
   checkpoints, and per-scenario evaluation metrics.
 
-[Install](#installation) · [Quick start](#quick-start) ·
-[Define an experiment](#define-your-own-experiment) ·
+SmallSatSim emerged from the SmallSat Steward project, a collaboration between
+researchers at Caltech's Jet Propulsion Laboratory and the University of Michigan's
+Space Systems Laboratory. This project is open-sourced under an
+[Apache 2.0 license](LICENSE).
+
+[Installation](#installation) · [Quick start](#quick-start) ·
+[Define your own experiment](#define-your-own-experiment) ·
 [Extend the API](#extend-the-api) ·
-[Train and evaluate](#training-and-evaluation) · [View and record](#viewers-and-video) ·
-[Paper benchmarks](#paper-benchmarks) · [Development](#development)
+[Training and evaluation](#training-and-evaluation) · [Viewers and video](#viewers-and-video) ·
+[Paper benchmarks](#paper-benchmarks) · [Development](#development) ·
+[Release artifacts](#release-artifacts)
 
 ## Installation
 
@@ -63,7 +66,7 @@ Verify the capabilities you installed:
 
 ```bash
 bash .setup/smallsat check             # Python dependencies
-bash .setup/smallsat check --mpc --gpu # Full Linux GPU/MPC installation
+bash .setup/smallsat check --mpc --gpu  # Full Linux GPU/MPC installation
 ```
 
 Use `bash .setup/smallsat run COMMAND` for the examples below. It sets native
@@ -73,7 +76,7 @@ commands or IDE debugging, source `.setup/env.sh` and select `.venv/bin/python`.
 When updating dependencies, retain your installation's extras. For the full stack:
 
 ```bash
-uv sync --locked --extra cuda12 --extra warp --extra mpc
+uv sync --locked --extra cuda12 --extra warp --extra mpc --extra paper
 ```
 
 <details>
@@ -89,41 +92,6 @@ old checkout aside and rerun setup; the installer preserves existing local chang
 See [.setup/native/install_mpc.sh](.setup/native/install_mpc.sh) for build details.
 
 </details>
-
-## Paper benchmarks
-
-**Learn SmallSatSim** with the quick start and editable [examples](examples).
-**Run reproducible experiments** with the [paper benchmark package](experiments/paper_benchmarks/README.md).
-
-The [publication tools](experiments/paper_benchmarks/publication/README.md) reproduce
-paper figures from retained data; generated files remain in the ignored `paper/` directory.
-The package includes Astrobee (`astrobee`), CubeSat (`cubesat`), and Sprint (`sprint`)
-portability checks. Campaign manifests record completion and missing runs.
-The experiment README documents execution, outputs, and validation limits.
-
-Use the Linux/NVIDIA installation with native MPC for the full suite. Retain your
-installed extras when adding the plotting dependency:
-
-```bash
-uv sync --locked --extra cuda12 --extra warp --extra mpc --extra paper
-bash .setup/smallsat run python -m experiments.paper_benchmarks.exp1_scaling --paper
-bash .setup/smallsat run python -m experiments.paper_benchmarks.exp2_fault_robustness --paper
-bash .setup/smallsat run python -m experiments.paper_benchmarks.exp3_rl_robustness --paper
-bash .setup/smallsat run python -m experiments.paper_benchmarks.exp4_docking --paper
-bash .setup/smallsat run python -m experiments.paper_benchmarks.spacecraft_portability --paper
-
-# Regenerate figures/tables from raw data, without retraining:
-bash .setup/smallsat run python -m experiments.paper_benchmarks.aggregate
-# Or run the full campaign and generate its artifacts:
-bash .setup/smallsat run python -m experiments.paper_benchmarks.reproduce_all --paper
-```
-
-Raw runs are retained under `results/demonstration_use_cases/paper`, identified by configuration,
-seed, and unique attempt. Postprocessing writes `artifacts/demonstration_use_cases`; the full
-campaign writes artifacts alongside its results. Scaling takes minutes; Monte Carlo
-and the 20-run learning program can take hours/days, depending on hardware. Use
-`--plan` to inspect jobs or `--smoke` for small validation runs. CPU-only smoke runs
-cannot validate GPU scaling or MPC without its native dependency.
 
 ## Quick start
 
@@ -170,10 +138,13 @@ bash .setup/smallsat run python examples/run_sprint.py
 Use `vehicle: sprint_rl` for RL or `vehicle: sprint` for classical controllers.
 Both select [vehicles/sprint.yaml](src/smallsat_sim/config/vehicles/sprint.yaml).
 The model uses a 15.88 kg body, 0.356 m diameter, twelve 0.378 N thrusters and
-published nominal inertia. Its spherical shell and camera features are approximate;
+nominal diagonal inertia of 0.1358 kg·m² per axis. Its spherical shell and camera
+features are approximate;
 thruster lines of action reproduce an idealized six-axis arrangement. Commands
-represent averaged force, not flight valve pulses. See the
-[validation notes](docs/spacecraft_candidate_validation.md) for sources and limits.
+represent averaged force, not flight valve pulses. The
+[asset metadata](src/smallsat_sim/config/vehicles/sprint.yaml) records source
+references and fidelity limits; [Sprint tests](src/tests/test_sprint.py) check
+analytic force/torque response and actuator saturation.
 The example runs one PPO epoch as an integration check, not a trained controller.
 
 Suppose you want to train PPO, the default RL method, to hold Astrobee at a fixed
@@ -260,7 +231,6 @@ experiment = make_experiment(
 
 Keyword overrides take precedence over YAML overrides. The returned object exposes
 `env`, `planner`, and either `runner` for RL or `controller` for classical control.
-Always close `experiment.env` when finished.
 
 ### 3. Adapt the experiment
 
@@ -401,7 +371,8 @@ asset: my_spacecraft.yaml
 `vehicle` selects the registered environment/task; `asset` supplies the physical
 spacecraft. This reuses the existing free-flyer RL environment with your vehicle.
 Keep the remaining training settings from the earlier example, then run
-`run_experiment.py`. Asset paths in YAML resolve relative to that experiment file.
+`run_experiment.py` with a new `RL.checkpoint_dir` so the changed asset starts a
+fresh run. Asset paths in YAML resolve relative to that experiment file.
 
 For Python code that needs named asset lookup, use
 `register_vehicle_file("my_spacecraft.yaml")`, `get_vehicle("my_spacecraft")`, and
@@ -458,6 +429,8 @@ from smallsat_sim.api.experiments import make_experiment
 
 experiment = make_experiment(
     "my_experiment.yaml", reward="my_lab/position_effort/v1",
+    run_name="my_position_reward",
+    overrides={"RL.checkpoint_dir": "experiments/rl_results/my_position_reward"},
 )
 try:
     experiment.runner.learn()
@@ -651,8 +624,10 @@ print(batch.actions.shape)  # (steps, environments, actuators)
 print(batch.step_outputs.rewards.shape)  # (steps, environments)
 ```
 
-This runs the configured rollout length with zero commands, useful for inspecting
-task rewards and dynamics before training. The
+This runs the current policy deterministically for the configured rollout length,
+useful for inspecting task rewards and dynamics before training. `"zero"` selects
+zero adaptation context; it does not set actuator commands to zero. A newly
+constructed runner uses its initialized policy until trained or restored. The
 [integrated experiment](examples/integrated_experiment.yaml) combines asset, task,
 reward, and effect extensions in one such collection run.
 
@@ -692,8 +667,8 @@ constant applied wrench use world coordinates; angular initial velocity uses the
 body frame. This interface currently supports a single free body with a shared
 pose reference. Reuse the same scenario list across policies for paired comparisons.
 Evaluation seeds identify supplied samples; they do not trigger additional sampling.
-Calling `runner.evaluate()` without scenarios retains the existing batch-summary
-behavior for compatibility.
+Calling `runner.evaluate()` without scenarios runs `training.n_evals` rollout
+batches and returns a list of metric summaries, one per batch.
 
 Use the [benchmark CLI](experiments/rl_benchmarking/benchmark.py) for named presets
 and seeded comparisons:
@@ -741,6 +716,7 @@ For an editable stage-by-stage workflow, use
 [train_astrobee.py](experiments/rl_training/train_astrobee.py). It can run supervised
 pretraining, learning, adaptation, and evaluation; the benchmark `train` command
 only runs learning and applicable adaptation stages. W&B is opt-in with `--wandb`.
+Adaptation requires at least two environments for its training/validation split.
 The benchmark enables local logging by default (`--no-log` disables it); the
 editable script enables it with `--log`.
 
@@ -789,6 +765,78 @@ Omit `--headless` for a classical simulation window. On a Linux desktop, use
 `viewer: {use_viser: true}` in their configuration, also without `--headless`.
 Shared defaults live in [simulation.yaml](src/smallsat_sim/config/simulation.yaml).
 
+If `mjpython` reports a missing `libpython` library with uv-managed Python on
+macOS, pass Python's library directory after the launcher:
+
+```bash
+bash .setup/smallsat run env \
+  DYLD_FALLBACK_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" \
+  mjpython experiments/test.py
+```
+
+Close the native window to stop this example.
+
+## Paper benchmarks
+
+The [paper benchmark package](experiments/paper_benchmarks/README.md) provides
+reproducible experiments for throughput, controller robustness, and docking.
+
+The [publication tools](experiments/paper_benchmarks/publication/README.md) reproduce
+paper figures from retained data; generated files remain in the ignored `paper/` directory.
+The package includes Astrobee (`astrobee`), CubeSat (`cubesat`), and Sprint (`sprint`)
+portability checks. Campaign manifests record completion and missing runs.
+The experiment README documents execution, outputs, and validation limits.
+
+### Run new experiments
+
+Use the Linux/NVIDIA installation with native MPC and the `paper` plotting extra
+for the full suite:
+
+```bash
+uv sync --locked --extra cuda12 --extra warp --extra mpc --extra paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp1_scaling --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp2_fault_robustness --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp3_rl_robustness --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.exp4_docking --paper
+bash .setup/smallsat run python -m experiments.paper_benchmarks.spacecraft_portability --paper
+
+# Regenerate figures/tables from raw data, without retraining:
+bash .setup/smallsat run python -m experiments.paper_benchmarks.aggregate
+# Or run the full campaign and generate its artifacts:
+bash .setup/smallsat run python -m experiments.paper_benchmarks.reproduce_all --paper
+```
+
+Aggregation requires a complete campaign by default. Use `--allow-partial` only
+for incomplete development results and inspect the generated manifest.
+
+Raw runs are retained under `results/demonstration_use_cases/paper`, identified by configuration,
+seed, and unique attempt. Postprocessing writes `artifacts/demonstration_use_cases`; the full
+campaign writes artifacts alongside its results. Full campaigns can take hours
+to days, depending on hardware and budgets; the learning program includes 20
+training runs. Use `--plan` to inspect jobs or `--smoke` for small validation runs. CPU-only smoke runs
+cannot validate GPU scaling or MPC without its native dependency.
+
+### Regenerate publication figures
+
+The publication pipeline consumes separately retained data bundles. A fresh clone
+contains the tools and configurations, but does not include or automatically
+download the measured campaign data. See the
+[publication README](experiments/paper_benchmarks/publication/README.md) for the
+required archive layouts, saved-pose rendering, and provenance manifests.
+
+For the current RL figures, point `--source` at a CSV bundle containing
+`data/exp3_training_curves.csv` and `data/exp3_evaluation_trials.csv`:
+
+```bash
+bash .setup/smallsat run python -m experiments.paper_benchmarks.publication.generate_rl \
+  --source PATH_TO_RL_CSV_BUNDLE --output paper
+```
+
+This writes the combined RL figure and standalone `training` and `evaluation`
+PDF/PNG figures under `paper/figures/rl/`. The full publication generator reproduces
+an older archived campaign; when using both generators, run `generate_rl` last to
+replace its RL figures with the current results.
+
 ## Development
 
 Add a regression test for new behavior or a bug fix, run the relevant tests, then
@@ -796,12 +844,14 @@ the full suite. For example:
 
 ```bash
 bash .setup/smallsat run pytest -q src/tests/test_yaml_experiments.py
-bash .setup/smallsat run pytest -q src/tests
-bash .setup/smallsat run ruff check src experiments examples
+bash .setup/smallsat run pytest -q src/tests .setup/tests
+bash .setup/smallsat run ruff check src experiments examples .setup/build_release.py
 ```
 
-Install pytest and Ruff by adding `--group dev` to your installation's `uv sync --locked`
-command, retaining its extras. MPC tests need the native stack. For viewer changes,
+Install the development tools and plotting dependency with `--group dev --extra paper`
+on your installation's `uv sync --locked` command, retaining its other extras.
+These test and lint commands match [CI](.github/workflows/ci.yml); CI also runs
+the [release wheel check](#release-artifacts). MPC tests need the native stack. For viewer changes,
 also inspect a live run or short recording on the target platform.
 
 For training or performance changes, use the focused
