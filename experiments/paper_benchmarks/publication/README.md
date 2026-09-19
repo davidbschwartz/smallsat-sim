@@ -18,6 +18,8 @@ The source directory must contain `data/exp3_training_curves.csv` and
 `../configs/exp3_rl_robustness/paper.yaml`. Outputs include:
 
 - `paper/figures/rl/learning_and_shift.{pdf,png}`: the two-panel paper figure.
+- `paper/figures/rl/training.{pdf,png}`: standalone training figure with its own legend.
+- `paper/figures/rl/evaluation.{pdf,png}`: standalone evaluation figure with its own legend.
 - `paper/diagnostics/rl/`: individual training and evaluation seed plots.
 - `paper/tables/learning_*.csv`: exact observed-step and windowed summaries.
 - `paper/rl_v3_manifest.json`: source hashes, generation command, episode counts,
@@ -43,6 +45,9 @@ layout: `paper-results/experiment_source/`, `paper-results/raw_runs/`, and
 `demonstration_all_recordings_traces/results/demonstration_campaign_final/paper/`.
 Rendering requires saved models, recordings, and traces as well as the generated
 tables. It replays saved poses without running controllers.
+
+The generator exports both `figures/model_based_robustness/distributions.{pdf,png}`
+and `distributions_vertical.{pdf,png}` in that directory, using the same trial data.
 
 The full generator reproduces the older frozen campaign, including its original
 RL results. Run `generate_rl` **after** it to replace the RL figure with the v3

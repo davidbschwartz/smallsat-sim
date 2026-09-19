@@ -11,6 +11,30 @@ import pytest
 from .generate import ROOT, exact_learning, representative
 
 
+def test_archived_campaign_exports_both_distribution_layouts(tmp_path, monkeypatch):
+    from PIL import Image
+    from . import generate
+
+    source = ROOT / "smallsat-demonstration"
+    if not (source / "paper-results/raw_runs").is_dir():
+        pytest.skip("Requires the archived campaign source bundle")
+    monkeypatch.setattr(sys, "argv", [
+        "generate", "--source", str(source), "--output", str(tmp_path),
+    ])
+    generate.main()
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    artifacts = {row["filename"]: row for row in manifest["artifacts"]}
+    base = "figures/model_based_robustness/distributions"
+    for suffix in ("pdf", "png"):
+        horizontal, vertical = f"{base}.{suffix}", f"{base}_vertical.{suffix}"
+        for name in (horizontal, vertical):
+            assert (tmp_path / name).stat().st_size > 0
+        assert artifacts[horizontal]["sources"] == artifacts[vertical]["sources"]
+        assert artifacts[horizontal]["samples"] == artifacts[vertical]["samples"]
+    with Image.open(tmp_path / f"{base}_vertical.png") as image:
+        assert image.height > image.width
+
+
 def test_rl_export_supports_source_outside_checkout(tmp_path, monkeypatch):
     from . import generate_rl
     from .generate import METHODS
